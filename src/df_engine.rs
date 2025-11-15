@@ -5,7 +5,7 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
 use std::fs;
-use std::pin::Pin; // [Added] Needed for directory listing
+use std::pin::Pin;
 
 #[cfg(feature = "delta")]
 use std::sync::Arc;
@@ -287,7 +287,6 @@ impl DFEngine {
             }
             #[cfg(feature = "delta")]
             TableType::Delta => {
-                // Use provided table_name or fall back to default
                 // Delta Lake has its own transaction log managing files.
                 // Current implementation simply registers the table, which means full scan.
                 // Proper segmentation for Delta requires using the low-level scan API to partition add_actions.
@@ -454,13 +453,17 @@ impl DFEngine {
 
 /// Convert a RecordBatch to CSV bytes
 fn batch_to_csv(batch: &RecordBatch) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
+    // Optimization: Pre-allocate vector to avoid reallocations.
+    // Heuristic: Average 100 bytes per row. Adjust based on expected data.
+    let estimated_size = batch.num_rows() * 100;
+    let mut buf = Vec::with_capacity(estimated_size);
+
     {
         // Use WriterBuilder to explicitly disable headers.
         // Otherwise, a header row would be written for EACH batch,
         // causing repeated column names to appear throughout the data stream.
         let mut writer = arrow_csv::WriterBuilder::new()
-            .has_headers(false) // <--- Critical fix: Disable headers
+            .with_header(false)
             .build(&mut buf);
 
         writer
