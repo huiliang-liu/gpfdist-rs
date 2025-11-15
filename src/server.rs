@@ -1,11 +1,11 @@
 use crate::df_engine::{DFEngine, DFRequest, TableType};
 use crate::util::{parse_query_map, percent_decode};
+use bytes::BytesMut;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use bytes::BytesMut;
 
 /// Create a unique table name for each request to avoid collisions
 /// Format: {source}_seg{sid}_{nanos}
@@ -15,13 +15,13 @@ fn make_unique_table_name(source: &str, segid: Option<usize>) -> String {
         .duration_since(UNIX_EPOCH)
         .expect("Failed to get current system time for generating unique table name. Check system clock settings.")
         .as_nanos();
-    
+
     let sid = segid.unwrap_or(0);
     let sanitized_source: String = source
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect();
-    
+
     format!("{}_seg{}_{}", sanitized_source, sid, nanos)
 }
 
@@ -45,7 +45,7 @@ impl Server {
         loop {
             let (socket, _) = listener.accept().await?;
             let df_engine = Arc::clone(&self.df_engine);
-            
+
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(socket, df_engine).await {
                     eprintln!("Error handling connection: {}", e);
@@ -61,14 +61,14 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0; 8192];
     let n = socket.read(&mut buf).await?;
-    
+
     if n == 0 {
         return Ok(());
     }
 
     let request = String::from_utf8_lossy(&buf[..n]);
     let lines: Vec<&str> = request.lines().collect();
-    
+
     if lines.is_empty() {
         send_error(&mut socket, 400, "Bad Request").await?;
         return Ok(());
@@ -98,9 +98,7 @@ async fn handle_connection(
     }
 
     // Parse X-GP-PROTO header
-    let gp_proto = headers
-        .get("x-gp-proto")
-        .and_then(|s| s.parse::<u8>().ok());
+    let gp_proto = headers.get("x-gp-proto").and_then(|s| s.parse::<u8>().ok());
 
     // Enforce X-GP-PROTO protocol mapping rules
     match method {
@@ -153,14 +151,14 @@ async fn handle_df_route(
     // Extract source type from path: /df/{source}
     let path_without_query = path.split('?').next().unwrap_or(path);
     let parts: Vec<&str> = path_without_query.split('/').collect();
-    
+
     if parts.len() < 3 {
         send_error(socket, 400, "Invalid /df/ route").await?;
         return Ok(());
     }
 
     let source = parts[2];
-    
+
     // Parse table type
     let table_type = match source {
         "parquet" => TableType::Parquet,
@@ -186,7 +184,7 @@ async fn handle_df_route(
 
     // Parse query parameters
     let query_map = parse_query_map(path);
-    
+
     // Extract parameters
     let uri = query_map.get("path").map(|s| s.clone());
     let files_str = query_map.get("files").map(|s| s.clone());
@@ -292,19 +290,21 @@ async fn handle_df_route(
                             if first_batch {
                                 // F frame: source label (use source type as label)
                                 socket.write_all(&frame_f(&source)).await?;
-                                
+
                                 // O frame: offset = 0
                                 socket.write_all(&frame_o(0)).await?;
-                                
+
                                 // L frame: line_no = 1
                                 socket.write_all(&frame_l(1)).await?;
-                                
+
                                 first_batch = false;
                             }
 
                             // Count lines in this batch
                             let newline_count = bytecount::count(&csv_bytes, b'\n');
-                            let rows_in_batch = if csv_bytes.is_empty() || csv_bytes[csv_bytes.len() - 1] == b'\n' {
+                            let rows_in_batch = if csv_bytes.is_empty()
+                                || csv_bytes[csv_bytes.len() - 1] == b'\n'
+                            {
                                 newline_count as u64
                             } else {
                                 // Last line doesn't end with newline, add 1
@@ -391,9 +391,13 @@ async fn handle_file_route(
         Ok(content) => content,
         Err(e) => {
             // Send error frame
-            let err_msg = format!("Failed to read file: {}, error {}", resolved_path.display(), e);
+            let err_msg = format!(
+                "Failed to read file: {}, error {}",
+                resolved_path.display(),
+                e
+            );
             eprintln!("{}", err_msg);
-            
+
             // Send HTTP header with X-GP-PROTO: 1
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
@@ -403,7 +407,7 @@ async fn handle_file_route(
                  \r\n"
             );
             socket.write_all(response.as_bytes()).await?;
-            
+
             // Send E frame + EOF
             socket.write_all(&frame_e(&err_msg)).await?;
             socket.write_all(&frame_eof()).await?;
@@ -416,7 +420,7 @@ async fn handle_file_route(
         // Find the position of the N-th newline
         let mut line_count = 0;
         let mut end_pos = file_content.len();
-        
+
         for (i, &byte) in file_content.iter().enumerate() {
             if byte == b'\n' {
                 line_count += 1;
@@ -426,7 +430,7 @@ async fn handle_file_route(
                 }
             }
         }
-        
+
         &file_content[..end_pos]
     } else {
         &file_content[..]
@@ -543,7 +547,7 @@ async fn send_error(
         500 => "Internal Server Error",
         _ => "Error",
     };
-    
+
     let response = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: text/plain\r\n\
@@ -551,7 +555,10 @@ async fn send_error(
          Connection: close\r\n\
          \r\n\
          {}",
-        status, status_text, message.len(), message
+        status,
+        status_text,
+        message.len(),
+        message
     );
     socket.write_all(response.as_bytes()).await?;
     Ok(())
@@ -562,7 +569,7 @@ fn truncate_to_lines(data: &[u8], lines: usize) -> Vec<u8> {
     if lines == 0 {
         return Vec::new();
     }
-    
+
     let mut line_count = 0;
     for (i, &byte) in data.iter().enumerate() {
         if byte == b'\n' {
@@ -572,7 +579,7 @@ fn truncate_to_lines(data: &[u8], lines: usize) -> Vec<u8> {
             }
         }
     }
-    
+
     // If we haven't found enough newlines, return all data
     data.to_vec()
 }

@@ -65,7 +65,8 @@ async fn test_server_framing_single_fol_async() {
         }
 
         let frame_type = frames[i];
-        let length = u32::from_be_bytes([frames[i + 1], frames[i + 2], frames[i + 3], frames[i + 4]]);
+        let length =
+            u32::from_be_bytes([frames[i + 1], frames[i + 2], frames[i + 3], frames[i + 4]]);
 
         match frame_type {
             b'F' => {
@@ -96,16 +97,19 @@ async fn test_server_framing_single_fol_async() {
         }
     }
 
-    println!("Frame counts: F={}, O={}, L={}, D={}, EOF={}", f_count, o_count, l_count, d_count, eof_count);
+    println!(
+        "Frame counts: F={}, O={}, L={}, D={}, EOF={}",
+        f_count, o_count, l_count, d_count, eof_count
+    );
 
     // Verify: F/O/L frames should appear exactly once
     assert_eq!(f_count, 1, "Should have exactly one F frame");
     assert_eq!(o_count, 1, "Should have exactly one O frame");
     assert_eq!(l_count, 1, "Should have exactly one L frame");
-    
+
     // Verify: At least one D frame with data
     assert!(d_count > 0, "Should have at least one D frame with data");
-    
+
     // Verify: Exactly one EOF frame
     assert_eq!(eof_count, 1, "Should have exactly one EOF frame");
 
@@ -122,7 +126,8 @@ async fn test_server_framing_single_fol_async() {
         }
 
         let frame_type = frames[i];
-        let length = u32::from_be_bytes([frames[i + 1], frames[i + 2], frames[i + 3], frames[i + 4]]);
+        let length =
+            u32::from_be_bytes([frames[i + 1], frames[i + 2], frames[i + 3], frames[i + 4]]);
 
         match frame_type {
             b'F' => {
@@ -170,7 +175,10 @@ fn create_test_parquet_file(path: &std::path::Path) -> Result<(), Box<dyn std::e
     let id_array = Int32Array::from(vec![1, 2, 3]);
     let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
 
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array), Arc::new(name_array)])?;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(id_array), Arc::new(name_array)],
+    )?;
 
     let file = File::create(path)?;
     let mut writer = ArrowWriter::try_new(file, schema, None)?;

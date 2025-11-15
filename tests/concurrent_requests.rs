@@ -24,7 +24,7 @@ async fn test_concurrent_segment_requests_async() {
     // Create temp directory with multiple parquet files
     let temp_dir = TempDir::new().unwrap();
     let dir_path = temp_dir.path();
-    
+
     // Create 3 parquet files
     for i in 0..3 {
         let file_path = dir_path.join(format!("test_{}.parquet", i));
@@ -38,12 +38,10 @@ async fn test_concurrent_segment_requests_async() {
     // Make 5 concurrent requests to the same directory path
     // Each request simulates a different segment
     let mut handles = vec![];
-    
+
     for seg_id in 0..5 {
         let path = dir_path.to_str().unwrap().to_string();
-        let handle = tokio::spawn(async move {
-            make_request_with_segment(&path, seg_id, 5).await
-        });
+        let handle = tokio::spawn(async move { make_request_with_segment(&path, seg_id, 5).await });
         handles.push(handle);
     }
 
@@ -102,7 +100,11 @@ async fn make_request_with_segment(path: &str, seg_id: usize, seg_count: usize) 
 
             // Check for success
             if !response.starts_with("HTTP/1.1 200 OK") {
-                eprintln!("Segment {} got non-200 response: {}", seg_id, response.lines().next().unwrap_or(""));
+                eprintln!(
+                    "Segment {} got non-200 response: {}",
+                    seg_id,
+                    response.lines().next().unwrap_or("")
+                );
                 return false;
             }
 
@@ -121,17 +123,16 @@ async fn make_request_with_segment(path: &str, seg_id: usize, seg_count: usize) 
     }
 }
 
-fn create_test_parquet_file(path: &std::path::Path, id_offset: i32) -> Result<(), Box<dyn std::error::Error>> {
+fn create_test_parquet_file(
+    path: &std::path::Path,
+    id_offset: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, false),
     ]));
 
-    let id_array = Int32Array::from(vec![
-        id_offset + 1,
-        id_offset + 2,
-        id_offset + 3,
-    ]);
+    let id_array = Int32Array::from(vec![id_offset + 1, id_offset + 2, id_offset + 3]);
     let name_array = StringArray::from(vec![
         format!("Name{}", id_offset + 1),
         format!("Name{}", id_offset + 2),
