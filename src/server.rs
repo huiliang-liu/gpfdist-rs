@@ -2,9 +2,28 @@ use crate::df_engine::{DFEngine, DFRequest, TableType};
 use crate::util::{parse_query_map, percent_decode};
 use futures::StreamExt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use bytes::BytesMut;
+
+/// Create a unique table name for each request to avoid collisions
+/// Format: {source}_seg{sid}_{nanos}
+/// Only letters, digits, and underscores are allowed in the identifier
+fn make_unique_table_name(source: &str, segid: Option<usize>) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Failed to get current system time for generating unique table name. Check system clock settings.")
+        .as_nanos();
+    
+    let sid = segid.unwrap_or(0);
+    let sanitized_source: String = source
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    
+    format!("{}_seg{}_{}", sanitized_source, sid, nanos)
+}
 
 pub struct Server {
     addr: String,
@@ -222,6 +241,14 @@ async fn handle_df_route(
         .get("x-gp-segment-count")
         .and_then(|s| s.parse::<usize>().ok());
 
+    // Generate unique table name for directory mode (when uri is provided but file_list is not)
+    // This prevents "table already exists" errors when multiple concurrent requests arrive
+    let table_name = if uri.is_some() && file_list.is_none() {
+        Some(make_unique_table_name(source, segment_id))
+    } else {
+        None
+    };
+
     // Build request
     let request = DFRequest {
         table_type,
@@ -233,6 +260,7 @@ async fn handle_df_route(
         segment_id,
         segment_count,
         gp_proto,
+        table_name,
     };
 
     // Execute query and stream results
