@@ -251,6 +251,7 @@ async fn handle_df_route(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn send_ok(socket: &mut TcpStream, body: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
@@ -449,6 +450,7 @@ fn truncate_to_lines(data: &[u8], lines: usize) -> Vec<u8> {
 // ========== gpfdist protocol framing helpers ==========
 
 /// Create a frame header: [type:1][length:4][line_or_offset:4]
+#[allow(dead_code)]
 fn frame_hdr(letter: u8, len: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(9);
     buf.push(letter);
