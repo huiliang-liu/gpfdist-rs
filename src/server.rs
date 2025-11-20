@@ -236,7 +236,7 @@ async fn handle_df_route(
     };
 
     // Execute query and stream results
-    match df_engine.execute_to_gpfdist_stream(request).await {
+    match df_engine.execute_csv_batches(request).await {
         Ok(mut stream) => {
             // Send success headers
             let response = format!(
@@ -249,28 +249,71 @@ async fn handle_df_route(
             );
             socket.write_all(response.as_bytes()).await?;
 
-            // Stream data
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        socket.write_all(&chunk).await?;
-                    }
-                    Err(e) => {
-                        eprintln!("Stream error: {}", e);
-                        if gp_proto == 1 {
-                            // Send error frame
-                            let err_msg = format!("ERROR: {}", e);
-                            let mut e_frame = vec![b'E'];
-                            e_frame.extend_from_slice(&(err_msg.len() as u32).to_be_bytes());
-                            e_frame.extend_from_slice(&0u32.to_be_bytes());
-                            e_frame.extend_from_slice(err_msg.as_bytes());
-                            socket.write_all(&e_frame).await?;
-                            
-                            // Send EOF
-                            let eof = vec![b'D', 0, 0, 0, 0, 0, 0, 0, 0];
-                            socket.write_all(&eof).await?;
+            // Protocol 1 requires framing at the server layer
+            if gp_proto == 1 {
+                // State for framing: first_batch flag, offset, line_no
+                let mut first_batch = true;
+                let mut _offset: u64 = 0;
+                let mut _line_no: u64 = 1;
+
+                // Stream data with server-side framing
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(csv_bytes) => {
+                            // On first batch only: emit F, O, L frames
+                            if first_batch {
+                                // F frame: source label (use source type as label)
+                                socket.write_all(&frame_f(&source)).await?;
+                                
+                                // O frame: offset = 0
+                                socket.write_all(&frame_o(0)).await?;
+                                
+                                // L frame: line_no = 1
+                                socket.write_all(&frame_l(1)).await?;
+                                
+                                first_batch = false;
+                            }
+
+                            // Count lines in this batch
+                            let newline_count = bytecount::count(&csv_bytes, b'\n');
+                            let rows_in_batch = if csv_bytes.is_empty() || csv_bytes[csv_bytes.len() - 1] == b'\n' {
+                                newline_count as u64
+                            } else {
+                                // Last line doesn't end with newline, add 1
+                                newline_count as u64 + 1
+                            };
+
+                            // Emit D frame with CSV data
+                            socket.write_all(&frame_d(&csv_bytes)).await?;
+
+                            // Update state
+                            _offset += csv_bytes.len() as u64;
+                            _line_no += rows_in_batch;
                         }
-                        break;
+                        Err(e) => {
+                            eprintln!("Stream error: {}", e);
+                            // Send error frame + EOF
+                            let err_msg = format!("ERROR: {}", e);
+                            socket.write_all(&frame_e(&err_msg)).await?;
+                            socket.write_all(&frame_eof()).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // After stream ends: emit EOF (zero-length D frame)
+                socket.write_all(&frame_eof()).await?;
+            } else {
+                // Protocol 0: raw CSV only (no framing)
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            socket.write_all(&chunk).await?;
+                        }
+                        Err(e) => {
+                            eprintln!("Stream error: {}", e);
+                            break;
+                        }
                     }
                 }
             }
