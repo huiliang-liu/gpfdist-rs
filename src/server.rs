@@ -79,12 +79,26 @@ async fn handle_connection(
 
     // Route handling
     if method == "GET" {
+        // Validate X-GP-PROTO header for GET requests
+        let gp_proto = headers
+            .get("x-gp-proto")
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(0);
+        
+        if gp_proto != 1 {
+            send_error(&mut socket, 400, "X-GP-PROTO must be 1 for GET").await?;
+            return Ok(());
+        }
+
         if path.starts_with("/df/") {
             handle_df_route(&mut socket, path, &headers, df_engine).await?;
         } else {
-            // Handle other routes (e.g., health check)
-            send_ok(&mut socket, b"gpfdist-rs").await?;
+            // Handle file serving with optional lines limit
+            handle_file_route(&mut socket, path, &headers).await?;
         }
+    } else if method == "POST" {
+        // POST not supported yet, but validate X-GP-PROTO would need to be 0
+        send_error(&mut socket, 400, "only GET supported").await?;
     } else {
         send_error(&mut socket, 405, "Method Not Allowed").await?;
     }
@@ -251,6 +265,98 @@ async fn handle_df_route(
     Ok(())
 }
 
+async fn handle_file_route(
+    socket: &mut TcpStream,
+    path: &str,
+    _headers: &std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::fs::File;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Parse file path and query parameters
+    let (file_path, query_str) = if let Some(pos) = path.find('?') {
+        (&path[1..pos], &path[pos + 1..])
+    } else {
+        (&path[1..], "")
+    };
+
+    // Parse query parameters for lines limit
+    let query_map = parse_query_map(&format!("?{}", query_str));
+    let lines_limit = query_map
+        .get("lines")
+        .and_then(|s| s.parse::<usize>().ok());
+
+    // Decode the file path
+    let decoded_path = percent_decode(file_path);
+    
+    // Try to open the file
+    let file = match File::open(&decoded_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            send_error(socket, 404, &format!("File not found: {}", e)).await?;
+            return Ok(());
+        }
+    };
+
+    // Always use gp_proto=1 for file serving (framed output)
+    let gp_proto = 1;
+
+    // Send success headers
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         X-GP-PROTO: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        gp_proto
+    );
+    socket.write_all(response.as_bytes()).await?;
+
+    // Send F frame (File header)
+    let f_frame = vec![b'F', 0, 0, 0, 0, 0, 0, 0, 0];
+    socket.write_all(&f_frame).await?;
+
+    // Send O frame (Offset)
+    let o_frame = vec![b'O', 0, 0, 0, 0, 0, 0, 0, 0];
+    socket.write_all(&o_frame).await?;
+
+    // Send L frame (Line number)
+    let l_frame = vec![b'L', 0, 0, 0, 0, 0, 0, 0, 0];
+    socket.write_all(&l_frame).await?;
+
+    // Read and send file content line by line
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut line_count = 0;
+
+    while let Some(line) = lines.next_line().await? {
+        if let Some(limit) = lines_limit {
+            if line_count >= limit {
+                break;
+            }
+        }
+
+        // Send D frame with CSV data (line + newline)
+        let mut data = line.into_bytes();
+        data.push(b'\n');
+        
+        let mut d_frame = vec![b'D'];
+        d_frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        d_frame.extend_from_slice(&0u32.to_be_bytes());
+        d_frame.extend_from_slice(&data);
+        
+        socket.write_all(&d_frame).await?;
+        line_count += 1;
+    }
+
+    // Send EOF frame (D with length 0)
+    let eof = vec![b'D', 0, 0, 0, 0, 0, 0, 0, 0];
+    socket.write_all(&eof).await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 async fn send_ok(socket: &mut TcpStream, body: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
