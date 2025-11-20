@@ -4,6 +4,7 @@ use futures::StreamExt;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use bytes::BytesMut;
 
 pub struct Server {
     addr: String,
@@ -77,16 +78,48 @@ async fn handle_connection(
         }
     }
 
-    // Route handling
-    if method == "GET" {
-        if path.starts_with("/df/") {
-            handle_df_route(&mut socket, path, &headers, df_engine).await?;
-        } else {
-            // Handle other routes (e.g., health check)
-            send_ok(&mut socket, b"gpfdist-rs").await?;
+    // Parse X-GP-PROTO header
+    let gp_proto = headers
+        .get("x-gp-proto")
+        .and_then(|s| s.parse::<u8>().ok());
+
+    // Enforce X-GP-PROTO protocol mapping rules
+    match method {
+        "GET" => {
+            // For GET requests, X-GP-PROTO MUST be 1
+            match gp_proto {
+                Some(1) => {
+                    // Valid GET with gp_proto=1
+                    if path.starts_with("/df/") {
+                        handle_df_route(&mut socket, path, &headers, df_engine).await?;
+                    } else {
+                        // Fallback file serving for non-/df/ paths
+                        handle_file_route(&mut socket, path).await?;
+                    }
+                }
+                _ => {
+                    // Missing or invalid X-GP-PROTO for GET
+                    send_error(&mut socket, 400, "X-GP-PROTO must be 1 for GET").await?;
+                }
+            }
         }
-    } else {
-        send_error(&mut socket, 405, "Method Not Allowed").await?;
+        "POST" => {
+            // For POST requests, X-GP-PROTO MUST be 0
+            match gp_proto {
+                Some(0) => {
+                    // Valid POST with gp_proto=0, but not yet supported
+                    send_error(&mut socket, 400, "only GET supported currently").await?;
+                }
+                _ => {
+                    // Missing or invalid X-GP-PROTO for POST
+                    send_error(&mut socket, 400, "X-GP-PROTO must be 0 for POST").await?;
+                }
+            }
+        }
+        _ => {
+            // Other methods are not supported
+            send_error(&mut socket, 400, "unsupported method").await?;
+        }
     }
 
     Ok(())
@@ -249,6 +282,180 @@ async fn handle_df_route(
     }
 
     Ok(())
+}
+
+async fn handle_file_route(
+    socket: &mut TcpStream,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Split path and query string
+    let (file_path, query_str) = if let Some(pos) = path.find('?') {
+        (&path[..pos], Some(&path[pos + 1..]))
+    } else {
+        (path, None)
+    };
+
+    // Percent-decode the file path
+    let decoded_path = percent_decode(file_path);
+
+    // Security: reject paths containing ".." to prevent directory traversal
+    if decoded_path.contains("..") {
+        send_error(socket, 400, "Path traversal not allowed").await?;
+        return Ok(());
+    }
+
+    // Parse query parameters for "lines" parameter
+    let lines_limit = if let Some(query) = query_str {
+        let query_map = parse_query_map(&format!("?{}", query));
+        query_map.get("lines").and_then(|s| s.parse::<usize>().ok())
+    } else {
+        None
+    };
+
+    // Resolve path (if relative, resolve against current working directory)
+    let resolved_path = if std::path::Path::new(&decoded_path).is_absolute() {
+        decoded_path.clone()
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {}", e))?;
+        cwd.join(&decoded_path)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    // Read the file
+    let file_content = match tokio::fs::read(&resolved_path).await {
+        Ok(content) => content,
+        Err(e) => {
+            // Send error frame
+            let err_msg = format!("Failed to read file: {}", e);
+            eprintln!("{}", err_msg);
+            
+            // Send HTTP header with X-GP-PROTO: 1
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 X-GP-PROTO: 1\r\n\
+                 Connection: close\r\n\
+                 \r\n"
+            );
+            socket.write_all(response.as_bytes()).await?;
+            
+            // Send E frame + EOF
+            socket.write_all(&frame_e(&err_msg)).await?;
+            socket.write_all(&frame_eof()).await?;
+            return Ok(());
+        }
+    };
+
+    // Apply lines limit if specified
+    let final_content = if let Some(limit) = lines_limit {
+        // Find the position of the N-th newline
+        let mut line_count = 0;
+        let mut end_pos = file_content.len();
+        
+        for (i, &byte) in file_content.iter().enumerate() {
+            if byte == b'\n' {
+                line_count += 1;
+                if line_count >= limit {
+                    end_pos = i + 1; // Include the newline
+                    break;
+                }
+            }
+        }
+        
+        &file_content[..end_pos]
+    } else {
+        &file_content[..]
+    };
+
+    // Send HTTP header with X-GP-PROTO: 1
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         X-GP-PROTO: 1\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    socket.write_all(response.as_bytes()).await?;
+
+    // Send frames: F, O, L, D, EOF
+    socket.write_all(&frame_f(&resolved_path)).await?;
+    socket.write_all(&frame_o(0)).await?;
+    socket.write_all(&frame_l(1)).await?;
+    socket.write_all(&frame_d(final_content)).await?;
+    socket.write_all(&frame_eof()).await?;
+
+    Ok(())
+}
+
+// Framing helper functions for gpfdist protocol 1
+// Frame format: [type:1][length:4][line_or_offset:4][data...]
+
+/// Create a frame header with type, length, and line/offset
+fn frame_hdr(letter: u8, len: u32) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9);
+    buf.extend_from_slice(&[letter]);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf
+}
+
+/// Create an 'F' (filename) frame
+fn frame_f(filename: &str) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9 + filename.len());
+    buf.extend_from_slice(&[b'F']);
+    buf.extend_from_slice(&(filename.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(filename.as_bytes());
+    buf
+}
+
+/// Create an 'O' (offset) frame
+fn frame_o(offset: u64) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9);
+    buf.extend_from_slice(&[b'O']);
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&(offset as u32).to_be_bytes());
+    buf
+}
+
+/// Create an 'L' (line number) frame
+fn frame_l(line_no: u64) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9);
+    buf.extend_from_slice(&[b'L']);
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&(line_no as u32).to_be_bytes());
+    buf
+}
+
+/// Create a 'D' (data) frame
+fn frame_d(data: &[u8]) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9 + data.len());
+    buf.extend_from_slice(&[b'D']);
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Create an 'E' (error) frame
+fn frame_e(msg: &str) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9 + msg.len());
+    buf.extend_from_slice(&[b'E']);
+    buf.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(msg.as_bytes());
+    buf
+}
+
+/// Create an EOF frame (D frame with length 0)
+fn frame_eof() -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9);
+    buf.extend_from_slice(&[b'D']);
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf
 }
 
 async fn send_ok(socket: &mut TcpStream, body: &[u8]) -> Result<(), Box<dyn std::error::Error>> {

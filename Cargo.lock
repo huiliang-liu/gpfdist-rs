@@ -1981,6 +1981,7 @@ dependencies = [
  "arrow 53.4.1",
  "arrow-csv 53.4.1",
  "async-stream",
+ "bytes",
  "datafusion",
  "deltalake",
  "futures",
