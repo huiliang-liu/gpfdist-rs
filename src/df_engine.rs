@@ -5,6 +5,8 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
+
+#[cfg(feature = "delta")]
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]

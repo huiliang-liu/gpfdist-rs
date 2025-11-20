@@ -1,8 +1,4 @@
-mod df_engine;
-mod server;
-mod util;
-
-use server::Server;
+use gpfdist_rs::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
