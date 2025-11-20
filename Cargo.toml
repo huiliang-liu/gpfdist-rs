@@ -1,6 +1,39 @@
 [package]
 name = "gpfdist-rs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[features]
+default = []
+delta = ["deltalake"]
+iceberg = ["iceberg-rust"]
 
 [dependencies]
+# Core async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# DataFusion and Arrow
+datafusion = "43.0"
+arrow = "53.0"
+arrow-csv = "53.0"
+parquet = "53.0"
+
+# Object store support
+object_store = "0.11"
+url = "2.5"
+
+# Async streaming
+futures = "0.3"
+async-stream = "0.3"
+
+# Utilities
+num_cpus = "1.16"
+
+# Optional Delta Lake support
+deltalake = { version = "0.22", optional = true, features = ["datafusion"] }
+
+# Optional Iceberg support
+iceberg-rust = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3.13"
