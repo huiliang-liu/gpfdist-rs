@@ -13,7 +13,7 @@ use bytes::BytesMut;
 fn make_unique_table_name(source: &str, segid: Option<usize>) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("System time should be after Unix epoch")
         .as_nanos();
     
     let sid = segid.unwrap_or(0);
