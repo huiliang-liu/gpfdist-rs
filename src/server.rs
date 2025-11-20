@@ -312,23 +312,15 @@ async fn handle_file_route(
         None
     };
 
-    // Resolve path (if relative, resolve against current working directory)
-    let resolved_path = if std::path::Path::new(&decoded_path).is_absolute() {
-        decoded_path.clone()
-    } else {
-        let cwd = std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e))?;
-        cwd.join(&decoded_path)
-            .to_string_lossy()
-            .to_string()
-    };
+    // Resolve path, the path is always relative to current working directory
+    let resolved_path = std::env::current_dir()?.join(&decoded_path.trim_start_matches('/'));
 
     // Read the file
     let file_content = match tokio::fs::read(&resolved_path).await {
         Ok(content) => content,
         Err(e) => {
             // Send error frame
-            let err_msg = format!("Failed to read file: {}", e);
+            let err_msg = format!("Failed to read file: {}, error {}", resolved_path.display(), e);
             eprintln!("{}", err_msg);
             
             // Send HTTP header with X-GP-PROTO: 1
@@ -380,7 +372,7 @@ async fn handle_file_route(
     socket.write_all(response.as_bytes()).await?;
 
     // Send frames: F, O, L, D, EOF
-    socket.write_all(&frame_f(&resolved_path)).await?;
+    socket.write_all(&frame_f(&decoded_path)).await?;
     socket.write_all(&frame_o(0)).await?;
     socket.write_all(&frame_l(1)).await?;
     socket.write_all(&frame_d(final_content)).await?;
@@ -403,10 +395,9 @@ fn frame_hdr(letter: u8, len: u32) -> BytesMut {
 
 /// Create an 'F' (filename) frame
 fn frame_f(filename: &str) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(9 + filename.len());
+    let mut buf = BytesMut::with_capacity(5 + filename.len());
     buf.extend_from_slice(&[b'F']);
     buf.extend_from_slice(&(filename.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&0u32.to_be_bytes());
     buf.extend_from_slice(filename.as_bytes());
     buf
 }
@@ -415,8 +406,8 @@ fn frame_f(filename: &str) -> BytesMut {
 fn frame_o(offset: u64) -> BytesMut {
     let mut buf = BytesMut::with_capacity(9);
     buf.extend_from_slice(&[b'O']);
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    buf.extend_from_slice(&(offset as u32).to_be_bytes());
+    buf.extend_from_slice(&8u32.to_be_bytes());
+    buf.extend_from_slice(&(offset).to_be_bytes());
     buf
 }
 
@@ -424,16 +415,15 @@ fn frame_o(offset: u64) -> BytesMut {
 fn frame_l(line_no: u64) -> BytesMut {
     let mut buf = BytesMut::with_capacity(9);
     buf.extend_from_slice(&[b'L']);
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    buf.extend_from_slice(&(line_no as u32).to_be_bytes());
+    buf.extend_from_slice(&8u32.to_be_bytes());
+    buf.extend_from_slice(&(line_no).to_be_bytes());
     buf
 }
 
 /// Create a 'D' (data) frame
 fn frame_d(data: &[u8]) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(9 + data.len());
+    let mut buf = BytesMut::with_capacity(5 + data.len());
     buf.extend_from_slice(&[b'D']);
-    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
     buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
     buf.extend_from_slice(data);
     buf
@@ -441,19 +431,17 @@ fn frame_d(data: &[u8]) -> BytesMut {
 
 /// Create an 'E' (error) frame
 fn frame_e(msg: &str) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(9 + msg.len());
+    let mut buf = BytesMut::with_capacity(5 + msg.len());
     buf.extend_from_slice(&[b'E']);
     buf.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&0u32.to_be_bytes());
     buf.extend_from_slice(msg.as_bytes());
     buf
 }
 
 /// Create an EOF frame (D frame with length 0)
 fn frame_eof() -> BytesMut {
-    let mut buf = BytesMut::with_capacity(9);
+    let mut buf = BytesMut::with_capacity(5);
     buf.extend_from_slice(&[b'D']);
-    buf.extend_from_slice(&0u32.to_be_bytes());
     buf.extend_from_slice(&0u32.to_be_bytes());
     buf
 }
@@ -498,141 +486,6 @@ async fn send_error(
     Ok(())
 }
 
-async fn handle_file_route(
-    socket: &mut TcpStream,
-    raw_path: &str,
-    headers: &std::collections::HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Parse path and query parameters
-    let path_without_query = raw_path.split('?').next().unwrap_or(raw_path);
-    let query_map = parse_query_map(raw_path);
-    
-    // Percent-decode the path
-    let decoded_path = percent_decode(path_without_query);
-    
-    // Security check: reject paths containing ".."
-    if decoded_path.contains("..") {
-        send_error(socket, 400, "Invalid path: directory traversal not allowed").await?;
-        return Ok(());
-    }
-    
-    // Resolve path (make absolute if relative)
-    let file_path = if decoded_path.starts_with('/') {
-        decoded_path.clone()
-    } else {
-        // Resolve relative to current working directory
-        let cwd = std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e))?;
-        cwd.join(&decoded_path)
-            .to_string_lossy()
-            .to_string()
-    };
-    
-    // Parse gp_proto from header (default 0)
-    let gp_proto = headers
-        .get("x-gp-proto")
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(0);
-    
-    if gp_proto > 1 {
-        send_error(socket, 400, "Invalid X-GP-PROTO (must be 0 or 1)").await?;
-        return Ok(());
-    }
-    
-    // Parse lines parameter
-    let lines_limit = query_map.get("lines").and_then(|s| s.parse::<usize>().ok());
-    
-    // Try to read the file
-    let file_data = match tokio::fs::read(&file_path).await {
-        Ok(data) => data,
-        Err(e) => {
-            if gp_proto == 1 {
-                // For proto 1, send error frame
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: application/octet-stream\r\n\
-                     X-GP-PROTO: 1\r\n\
-                     Connection: close\r\n\
-                     \r\n"
-                );
-                socket.write_all(response.as_bytes()).await?;
-                
-                let err_msg = format!("Failed to read file {}: {}", file_path, e);
-                let e_frame = frame_e(&err_msg);
-                socket.write_all(&e_frame).await?;
-                
-                let eof_frame = frame_eof();
-                socket.write_all(&eof_frame).await?;
-            } else {
-                // For proto 0, send HTTP error
-                let status = if e.kind() == std::io::ErrorKind::NotFound {
-                    404
-                } else {
-                    500
-                };
-                let msg = format!("Failed to read file: {}", e);
-                send_error(socket, status, &msg).await?;
-            }
-            return Ok(());
-        }
-    };
-    
-    // Apply lines limit if specified
-    let output_data = if let Some(limit) = lines_limit {
-        truncate_to_lines(&file_data, limit)
-    } else {
-        file_data
-    };
-    
-    // Send response based on gp_proto
-    if gp_proto == 0 {
-        // Protocol 0: HTTP OK + raw bytes
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/octet-stream\r\n\
-             X-GP-PROTO: 0\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            output_data.len()
-        );
-        socket.write_all(response.as_bytes()).await?;
-        socket.write_all(&output_data).await?;
-    } else {
-        // Protocol 1: HTTP OK + framed output
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/octet-stream\r\n\
-             X-GP-PROTO: 1\r\n\
-             Connection: close\r\n\
-             \r\n"
-        );
-        socket.write_all(response.as_bytes()).await?;
-        
-        // Send F frame (filename)
-        let f_frame = frame_f(&decoded_path);
-        socket.write_all(&f_frame).await?;
-        
-        // Send O frame (offset = 0)
-        let o_frame = frame_o(0);
-        socket.write_all(&o_frame).await?;
-        
-        // Send L frame (line start = 1)
-        let l_frame = frame_l(1);
-        socket.write_all(&l_frame).await?;
-        
-        // Send D frame (data)
-        let d_frame = frame_d(&output_data);
-        socket.write_all(&d_frame).await?;
-        
-        // Send EOF frame
-        let eof_frame = frame_eof();
-        socket.write_all(&eof_frame).await?;
-    }
-    
-    Ok(())
-}
-
 /// Truncate data to the first N lines (newline-terminated)
 fn truncate_to_lines(data: &[u8], lines: usize) -> Vec<u8> {
     if lines == 0 {
@@ -651,75 +504,4 @@ fn truncate_to_lines(data: &[u8], lines: usize) -> Vec<u8> {
     
     // If we haven't found enough newlines, return all data
     data.to_vec()
-}
-
-// ========== gpfdist protocol framing helpers ==========
-
-/// Create a frame header: [type:1][length:4][line_or_offset:4]
-#[allow(dead_code)]
-fn frame_hdr(letter: u8, len: u32) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(9);
-    buf.push(letter);
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(&0u32.to_be_bytes()); // Reserved field
-    buf
-}
-
-/// Create F frame (filename)
-fn frame_f(filename: &str) -> Vec<u8> {
-    let filename_bytes = filename.as_bytes();
-    let mut frame = Vec::with_capacity(9 + filename_bytes.len());
-    frame.push(b'F');
-    frame.extend_from_slice(&(filename_bytes.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&0u32.to_be_bytes());
-    frame.extend_from_slice(filename_bytes);
-    frame
-}
-
-/// Create O frame (offset)
-fn frame_o(offset: u64) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(9);
-    frame.push(b'O');
-    frame.extend_from_slice(&(offset as u32).to_be_bytes());
-    frame.extend_from_slice(&0u32.to_be_bytes());
-    frame
-}
-
-/// Create L frame (line number)
-fn frame_l(line_no: u64) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(9);
-    frame.push(b'L');
-    frame.extend_from_slice(&(line_no as u32).to_be_bytes());
-    frame.extend_from_slice(&0u32.to_be_bytes());
-    frame
-}
-
-/// Create D frame (data)
-fn frame_d(data: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(9 + data.len());
-    frame.push(b'D');
-    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    frame.extend_from_slice(data);
-    frame
-}
-
-/// Create E frame (error message)
-fn frame_e(msg: &str) -> Vec<u8> {
-    let msg_bytes = msg.as_bytes();
-    let mut frame = Vec::with_capacity(9 + msg_bytes.len());
-    frame.push(b'E');
-    frame.extend_from_slice(&(msg_bytes.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&0u32.to_be_bytes());
-    frame.extend_from_slice(msg_bytes);
-    frame
-}
-
-/// Create EOF frame (D frame with length 0)
-fn frame_eof() -> Vec<u8> {
-    let mut frame = Vec::with_capacity(9);
-    frame.push(b'D');
-    frame.extend_from_slice(&0u32.to_be_bytes());
-    frame.extend_from_slice(&0u32.to_be_bytes());
-    frame
 }
