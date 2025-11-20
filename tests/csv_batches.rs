@@ -45,6 +45,7 @@ async fn test_execute_csv_batches() {
         segment_id: None,
         segment_count: None,
         gp_proto: 1,
+        table_name: None,
     };
     
     let mut stream = engine.execute_csv_batches(request).await.unwrap();
