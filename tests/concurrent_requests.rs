@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
 
+const TEST_SERVER_ADDR: &str = "127.0.0.1:18080";
+
 #[test]
 #[ignore]
 fn test_concurrent_segment_requests() {
@@ -85,7 +87,7 @@ async fn make_request_with_segment(path: &str, seg_id: usize, seg_count: usize) 
         url, seg_id, seg_count
     );
 
-    match TcpStream::connect("127.0.0.1:18080") {
+    match TcpStream::connect(TEST_SERVER_ADDR) {
         Ok(mut stream) => {
             if let Err(e) = stream.write_all(request.as_bytes()) {
                 eprintln!("Failed to write request for segment {}: {}", seg_id, e);
@@ -151,8 +153,8 @@ fn create_test_parquet_file(path: &std::path::Path, id_offset: i32) -> Result<()
 
 fn start_test_server() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
-        std::env::set_var("GPFDIST_ADDR", "127.0.0.1:18080");
-        let server = gpfdist_rs::Server::new("127.0.0.1:18080".to_string());
+        std::env::set_var("GPFDIST_ADDR", TEST_SERVER_ADDR);
+        let server = gpfdist_rs::Server::new(TEST_SERVER_ADDR.to_string());
         let _ = server.run().await;
     })
 }
