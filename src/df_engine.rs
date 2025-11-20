@@ -235,15 +235,12 @@ impl DFEngine {
             }
             #[cfg(feature = "iceberg")]
             TableType::Iceberg => {
-                // Use provided table_name or fall back to default
-                let table_name = request.table_name.as_deref().unwrap_or("iceberg_table");
-                self.register_iceberg(table_name, &request.uri)
-                    .await
-                    .map_err(|e| format!("Failed to register iceberg table: {}", e))?;
-                
-                self.ctx.table(table_name)
-                    .await
-                    .map_err(|e| format!("Failed to get table: {}", e))
+                // Iceberg support is not fully implemented yet
+                // When implemented, it should use unique table names like parquet and delta:
+                // let table_name = request.table_name.as_deref().unwrap_or("iceberg_table");
+                // self.register_iceberg(table_name, &request.uri).await?;
+                // self.ctx.table(table_name).await?;
+                Err("Iceberg support is not fully implemented yet".to_string())
             }
         }
     }
