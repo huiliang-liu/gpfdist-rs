@@ -125,7 +125,57 @@ impl DFEngine {
         sql
     }
 
+    /// Execute the request and return raw CSV batches without gpfdist framing.
+    /// The server layer is responsible for adding protocol frames (F/O/L/D/EOF).
+    /// This method takes a DataFrame and returns a stream of raw CSV byte vectors,
+    /// one per RecordBatch.
+    pub async fn execute_csv_batches(
+        &self,
+        request: DFRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>, String> {
+        // Get the dataframe based on table type and request parameters
+        let df = self.get_dataframe(&request).await?;
+
+        // Apply projection, filter, and limit through SQL if needed
+        let df = self.apply_transformations(df, &request).await?;
+
+        // Execute the query and get a stream of record batches
+        let batches = df.execute_stream().await
+            .map_err(|e| format!("Failed to execute query: {}", e))?;
+
+        // Convert to CSV stream without framing
+        Ok(Box::pin(self.convert_to_csv_stream(batches)))
+    }
+
+    /// Convert a stream of RecordBatch to a stream of raw CSV bytes
+    fn convert_to_csv_stream(
+        &self,
+        mut batches: Pin<Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>>,
+    ) -> impl Stream<Item = Result<Vec<u8>, String>> + Send {
+        async_stream::try_stream! {
+            while let Some(batch_result) = batches.next().await {
+                let batch = batch_result.map_err(|e| format!("Failed to get batch: {}", e))?;
+
+                // Convert batch to CSV in a blocking task
+                let csv_data = tokio::task::spawn_blocking(move || {
+                    batch_to_csv(&batch)
+                })
+                .await
+                .map_err(|e| format!("Failed to spawn blocking task: {}", e))?
+                .map_err(|e| format!("Failed to convert batch to CSV: {}", e))?;
+
+                if !csv_data.is_empty() {
+                    yield csv_data;
+                }
+            }
+        }
+    }
+
     /// Execute the request and return a stream of bytes in gpfdist format
+    /// 
+    /// DEPRECATED: This method performs framing inside the engine layer.
+    /// The new approach is to use `execute_csv_batches()` and perform framing
+    /// at the server layer for better protocol control.
     pub async fn execute_to_gpfdist_stream(
         &self,
         request: DFRequest,
