@@ -29,6 +29,7 @@ pub struct DFRequest {
     pub segment_id: Option<usize>,
     pub segment_count: Option<usize>,
     pub gp_proto: u8,
+    pub table_name: Option<String>,
 }
 
 pub struct DFEngine {
@@ -209,7 +210,8 @@ impl DFEngine {
                         .await
                         .map_err(|e| format!("Failed to create dataframe from files: {}", e))
                 } else {
-                    let table_name = "parquet_table";
+                    // Use provided table_name or fall back to default
+                    let table_name = request.table_name.as_deref().unwrap_or("parquet_table");
                     self.register_parquet_dir(table_name, &request.uri)
                         .await
                         .map_err(|e| format!("Failed to register parquet directory: {}", e))?;
@@ -221,7 +223,8 @@ impl DFEngine {
             }
             #[cfg(feature = "delta")]
             TableType::Delta => {
-                let table_name = "delta_table";
+                // Use provided table_name or fall back to default
+                let table_name = request.table_name.as_deref().unwrap_or("delta_table");
                 self.register_delta(table_name, &request.uri)
                     .await
                     .map_err(|e| format!("Failed to register delta table: {}", e))?;
@@ -232,7 +235,15 @@ impl DFEngine {
             }
             #[cfg(feature = "iceberg")]
             TableType::Iceberg => {
-                Err("Iceberg support is not fully implemented yet".to_string())
+                // Use provided table_name or fall back to default
+                let table_name = request.table_name.as_deref().unwrap_or("iceberg_table");
+                self.register_iceberg(table_name, &request.uri)
+                    .await
+                    .map_err(|e| format!("Failed to register iceberg table: {}", e))?;
+                
+                self.ctx.table(table_name)
+                    .await
+                    .map_err(|e| format!("Failed to get table: {}", e))
             }
         }
     }
