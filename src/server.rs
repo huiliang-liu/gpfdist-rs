@@ -377,8 +377,6 @@ async fn handle_df_route(
         #[cfg(feature = "iceberg")]
         TableType::Iceberg => file_list.is_none(),
         TableType::Parquet => false, // Parquet uses file-level segmentation
-        #[cfg(all(not(feature = "delta"), not(feature = "iceberg")))]
-        _ => false,
     };
 
     // If session headers are present and this source supports session caching, check session state
