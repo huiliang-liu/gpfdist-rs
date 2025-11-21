@@ -2,6 +2,7 @@ use crate::df_engine::{DFEngine, DFRequest, TableType};
 use crate::util::{parse_query_map, percent_decode};
 use bytes::BytesMut;
 use futures::StreamExt;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -81,21 +82,27 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
         let now = Instant::now();
         sessions.retain(|_key, state| {
-            if let SessionStatus::Completed = state.status {
-                if let Some(completed_at) = state.completed_at {
-                    // Keep if not yet expired
-                    return now.duration_since(completed_at) < ttl;
+            match state.status {
+                SessionStatus::Completed => {
+                    if let Some(completed_at) = state.completed_at {
+                        // Keep if not yet expired
+                        now.duration_since(completed_at) < ttl
+                    } else {
+                        // Keep sessions without completed_at timestamp
+                        true
+                    }
+                }
+                SessionStatus::InProgress => {
+                    // Keep InProgress sessions
+                    true
                 }
             }
-            // Keep InProgress sessions
-            true
         });
     }
 }
 
 // Global static session manager
-static SESSION_MANAGER: once_cell::sync::Lazy<SessionManager> =
-    once_cell::sync::Lazy::new(|| SessionManager::new());
+static SESSION_MANAGER: Lazy<SessionManager> = Lazy::new(|| SessionManager::new());
 
 /// Extract session key from headers (X-GP-XID, X-GP-CID, X-GP-SN)
 fn extract_session_key(headers: &std::collections::HashMap<String, String>) -> Option<SessionKey> {
