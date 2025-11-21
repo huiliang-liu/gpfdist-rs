@@ -185,26 +185,23 @@ async fn test_file_serving_proto_1_whole_file_async() {
     stream.read_to_end(&mut response).unwrap();
 
     // Parse HTTP headers
-    let header_end = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap() + 4;
+    let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let headers = String::from_utf8_lossy(&response[..header_end]);
-    
+
     assert!(headers.contains("HTTP/1.1 200 OK"));
     assert!(headers.contains("X-GP-PROTO: 1"));
 
     // Check for frames in body
     let body = &response[header_end..];
-    
+
     // Should start with F frame
     assert_eq!(body[0], b'F');
-    
+
     // Should contain O, L, D frames
     let has_o_frame = body.windows(1).any(|w| w[0] == b'O');
     let has_l_frame = body.windows(1).any(|w| w[0] == b'L');
     let has_d_frame = body.windows(1).any(|w| w[0] == b'D');
-    
+
     assert!(has_o_frame, "Should contain O frame");
     assert!(has_l_frame, "Should contain L frame");
     assert!(has_d_frame, "Should contain D frame");
@@ -241,12 +238,9 @@ async fn test_file_serving_proto_1_with_lines_async() {
     stream.read_to_end(&mut response).unwrap();
 
     // Parse HTTP headers
-    let header_end = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap() + 4;
+    let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let headers = String::from_utf8_lossy(&response[..header_end]);
-    
+
     assert!(headers.contains("HTTP/1.1 200 OK"));
     assert!(headers.contains("X-GP-PROTO: 1"));
 
@@ -312,12 +306,9 @@ async fn test_file_not_found_proto_1_async() {
     assert!(headers.contains("HTTP/1.1 200 OK"));
 
     // Should contain E frame in body
-    let header_end = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap() + 4;
+    let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let body = &response[header_end..];
-    
+
     assert_eq!(body[0], b'E', "Should start with E frame for error");
 
     // Cleanup

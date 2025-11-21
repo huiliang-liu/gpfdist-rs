@@ -4,6 +4,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
+use std::fs;
 use std::pin::Pin;
 
 #[cfg(feature = "delta")]
@@ -44,17 +45,27 @@ impl DFEngine {
     }
 
     /// Register a parquet directory as a table
-    pub async fn register_parquet_dir(&self, table_name: &str, path: &str) -> Result<(), DataFusionError> {
-        self.ctx.register_parquet(table_name, path, Default::default()).await?;
+    pub async fn register_parquet_dir(
+        &self,
+        table_name: &str,
+        path: &str,
+    ) -> Result<(), DataFusionError> {
+        self.ctx
+            .register_parquet(table_name, path, Default::default())
+            .await?;
         Ok(())
     }
 
     #[cfg(feature = "delta")]
-    pub async fn register_delta(&self, table_name: &str, path: &str) -> Result<(), DataFusionError> {
+    pub async fn register_delta(
+        &self,
+        table_name: &str,
+        path: &str,
+    ) -> Result<(), DataFusionError> {
         let table = deltalake::open_table(path)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        
+
         // Register the delta table directly using DeltaTable as a TableProvider
         let provider = Arc::new(table);
         self.ctx.register_table(table_name, provider)?;
@@ -62,36 +73,33 @@ impl DFEngine {
     }
 
     #[cfg(feature = "iceberg")]
-    pub async fn register_iceberg(&self, _table_name: &str, _path: &str) -> Result<(), DataFusionError> {
+    pub async fn register_iceberg(
+        &self,
+        _table_name: &str,
+        _path: &str,
+    ) -> Result<(), DataFusionError> {
         // Placeholder for Iceberg support
         // The iceberg-rust crate is still evolving; this is a basic placeholder
         Err(DataFusionError::NotImplemented(
-            "Iceberg support is not fully implemented yet".to_string()
+            "Iceberg support is not fully implemented yet".to_string(),
         ))
     }
 
-    /// Create a DataFrame directly from a list of parquet files
-    pub async fn dataframe_from_parquet_files(&self, files: &[String]) -> Result<DataFrame, DataFusionError> {
+    /// Create a DataFrame directly from a list of parquet files.
+    /// Optimized to use DataFusion's native multi-file reader.
+    pub async fn dataframe_from_parquet_files(
+        &self,
+        files: &[String],
+    ) -> Result<DataFrame, DataFusionError> {
         if files.is_empty() {
             return Err(DataFusionError::Plan("No files provided".to_string()));
         }
 
-        // Register each file and union them
-        let mut dfs = Vec::new();
-        for (i, file) in files.iter().enumerate() {
-            let table_name = format!("temp_table_{}", i);
-            self.ctx.register_parquet(&table_name, file, Default::default()).await?;
-            let df = self.ctx.table(&table_name).await?;
-            dfs.push(df);
-        }
-
-        // Union all dataframes
-        let mut result = dfs[0].clone();
-        for df in dfs.iter().skip(1) {
-            result = result.union(df.clone())?;
-        }
-
-        Ok(result)
+        // Use DataFusion's read_parquet which supports a vector of file paths.
+        // This is more efficient than unioning individual dataframes.
+        self.ctx
+            .read_parquet(files.to_vec(), Default::default())
+            .await
     }
 
     /// Build a SQL query string for SELECT + projection + WHERE + LIMIT
@@ -141,7 +149,9 @@ impl DFEngine {
         let df = self.apply_transformations(df, &request).await?;
 
         // Execute the query and get a stream of record batches
-        let batches = df.execute_stream().await
+        let batches = df
+            .execute_stream()
+            .await
             .map_err(|e| format!("Failed to execute query: {}", e))?;
 
         // Convert to CSV stream without framing
@@ -173,7 +183,7 @@ impl DFEngine {
     }
 
     /// Execute the request and return a stream of bytes in gpfdist format
-    /// 
+    ///
     /// DEPRECATED: This method performs framing inside the engine layer.
     /// The new approach is to use `execute_csv_batches()` and perform framing
     /// at the server layer for better protocol control.
@@ -188,48 +198,105 @@ impl DFEngine {
         let df = self.apply_transformations(df, &request).await?;
 
         // Execute the query and get a stream of record batches
-        let batches = df.execute_stream().await
+        let batches = df
+            .execute_stream()
+            .await
             .map_err(|e| format!("Failed to execute query: {}", e))?;
 
         // Convert to gpfdist format
-        Ok(Box::pin(self.convert_to_gpfdist_stream(batches, request.gp_proto)))
+        Ok(Box::pin(
+            self.convert_to_gpfdist_stream(batches, request.gp_proto),
+        ))
     }
 
     async fn get_dataframe(&self, request: &DFRequest) -> Result<DataFrame, String> {
         match &request.table_type {
             TableType::Parquet => {
-                if let Some(files) = &request.file_list {
-                    // Filter files based on segmentation
-                    let filtered_files = self.apply_segmentation(files, request.segment_id, request.segment_count);
-                    
-                    if filtered_files.is_empty() {
-                        return Err("No files assigned to this segment".to_string());
+                // 1. Get the complete list of files
+                let all_files = if let Some(files) = &request.file_list {
+                    // Case A: User provided explicit file list via 'files=...'
+                    files.clone()
+                } else {
+                    // Case B: User provided a directory path via 'path=...'
+                    // We must list and sort files manually to ensure consistent segmentation.
+                    let path = &request.uri;
+                    let mut file_list = Vec::new();
+
+                    let entries = fs::read_dir(path)
+                        .map_err(|e| format!("Failed to read directory {}: {}", path, e))?;
+
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            let path_buf = entry.path();
+                            if path_buf.is_file() {
+                                if let Some(path_str) = path_buf.to_str() {
+                                    if path_str.ends_with(".parquet") {
+                                        file_list.push(path_str.to_string());
+                                    }
+                                }
+                            }
+                        }
                     }
 
-                    self.dataframe_from_parquet_files(&filtered_files)
+                    // CRITICAL: Sort the file list!
+                    // Different OS/filesystems may return files in different orders.
+                    // Without sorting, 'index % count' would assign different files
+                    // on different segments if they see different orders, leading to data corruption.
+                    file_list.sort();
+
+                    if file_list.is_empty() {
+                        return Err(format!("No parquet files found in directory: {}", path));
+                    }
+
+                    file_list
+                };
+
+                // 2. Apply segmentation logic
+                // This filters the list so this segment only reads its assigned share.
+                let filtered_files =
+                    self.apply_segmentation(&all_files, request.segment_id, request.segment_count);
+
+                if filtered_files.is_empty() {
+                    // Case: Number of files < Number of segments.
+                    // Some segments get no files. We should not error out, as that would fail the whole query.
+                    // Instead, we return an empty DataFrame with the correct schema.
+
+                    // We borrow the schema from the first available file in the full list.
+                    if all_files.is_empty() {
+                        return Err("No files available to infer schema".to_string());
+                    }
+
+                    // Read just one file to get the schema
+                    let schema_inference_file = vec![all_files[0].clone()];
+                    let df = self
+                        .ctx
+                        .read_parquet(schema_inference_file, Default::default())
                         .await
-                        .map_err(|e| format!("Failed to create dataframe from files: {}", e))
-                } else {
-                    // Use provided table_name or fall back to default
-                    let table_name = request.table_name.as_deref().unwrap_or("parquet_table");
-                    self.register_parquet_dir(table_name, &request.uri)
-                        .await
-                        .map_err(|e| format!("Failed to register parquet directory: {}", e))?;
-                    
-                    self.ctx.table(table_name)
-                        .await
-                        .map_err(|e| format!("Failed to get table: {}", e))
+                        .map_err(|e| format!("Failed to read file for schema inference: {}", e))?;
+
+                    // Apply a limit of 0 to return an empty result set with the correct schema.
+                    return df
+                        .limit(0, Some(0))
+                        .map_err(|e| format!("Failed to create empty dataframe: {}", e));
                 }
+
+                // 3. Create DataFrame from the assigned files
+                self.dataframe_from_parquet_files(&filtered_files)
+                    .await
+                    .map_err(|e| format!("Failed to create dataframe from files: {}", e))
             }
             #[cfg(feature = "delta")]
             TableType::Delta => {
-                // Use provided table_name or fall back to default
+                // Delta Lake has its own transaction log managing files.
+                // Current implementation simply registers the table, which means full scan.
+                // Proper segmentation for Delta requires using the low-level scan API to partition add_actions.
                 let table_name = request.table_name.as_deref().unwrap_or("delta_table");
                 self.register_delta(table_name, &request.uri)
                     .await
                     .map_err(|e| format!("Failed to register delta table: {}", e))?;
-                
-                self.ctx.table(table_name)
+
+                self.ctx
+                    .table(table_name)
                     .await
                     .map_err(|e| format!("Failed to get table: {}", e))
             }
@@ -245,26 +312,35 @@ impl DFEngine {
         }
     }
 
-    fn apply_segmentation(&self, files: &[String], segment_id: Option<usize>, segment_count: Option<usize>) -> Vec<String> {
+    fn apply_segmentation(
+        &self,
+        files: &[String],
+        segment_id: Option<usize>,
+        segment_count: Option<usize>,
+    ) -> Vec<String> {
         match (segment_id, segment_count) {
-            (Some(seg_id), Some(seg_count)) if seg_count > 0 => {
-                files.iter()
-                    .enumerate()
-                    .filter(|(i, _)| i % seg_count == seg_id)
-                    .map(|(_, f)| f.clone())
-                    .collect()
-            }
+            (Some(seg_id), Some(seg_count)) if seg_count > 0 => files
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % seg_count == seg_id)
+                .map(|(_, f)| f.clone())
+                .collect(),
             _ => files.to_vec(),
         }
     }
 
-    async fn apply_transformations(&self, df: DataFrame, request: &DFRequest) -> Result<DataFrame, String> {
+    async fn apply_transformations(
+        &self,
+        df: DataFrame,
+        request: &DFRequest,
+    ) -> Result<DataFrame, String> {
         let mut df = df;
 
         // Apply projection
         if let Some(cols) = &request.projection {
             let col_refs: Vec<_> = cols.iter().map(|c| col(c)).collect();
-            df = df.select(col_refs)
+            df = df
+                .select(col_refs)
                 .map_err(|e| format!("Failed to apply projection: {}", e))?;
         }
 
@@ -274,21 +350,30 @@ impl DFEngine {
             // A more robust solution would parse the filter expression
             // For now, we'll register the dataframe as a temp table and query it
             let temp_table = "temp_filtered";
-            self.ctx.register_table(temp_table, df.into_view())
+            self.ctx
+                .register_table(temp_table, df.into_view())
                 .map_err(|e| format!("Failed to register temp table: {}", e))?;
-            
-            let sql = self.build_sql(temp_table, request.projection.as_deref(), Some(filter_expr), request.limit);
-            
-            df = self.ctx.sql(&sql)
+
+            let sql = self.build_sql(
+                temp_table,
+                request.projection.as_deref(),
+                Some(filter_expr),
+                request.limit,
+            );
+
+            df = self
+                .ctx
+                .sql(&sql)
                 .await
                 .map_err(|e| format!("Failed to execute filter SQL: {}", e))?;
-            
+
             return Ok(df);
         }
 
         // Apply limit
         if let Some(lim) = request.limit {
-            df = df.limit(0, Some(lim))
+            df = df
+                .limit(0, Some(lim))
                 .map_err(|e| format!("Failed to apply limit: {}", e))?;
         }
 
@@ -368,10 +453,21 @@ impl DFEngine {
 
 /// Convert a RecordBatch to CSV bytes
 fn batch_to_csv(batch: &RecordBatch) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
+    // Optimization: Pre-allocate vector to avoid reallocations.
+    // Heuristic: Average 100 bytes per row. Adjust based on expected data.
+    let estimated_size = batch.num_rows() * 100;
+    let mut buf = Vec::with_capacity(estimated_size);
+
     {
-        let mut writer = arrow_csv::Writer::new(&mut buf);
-        writer.write(batch)
+        // Use WriterBuilder to explicitly disable headers.
+        // Otherwise, a header row would be written for EACH batch,
+        // causing repeated column names to appear throughout the data stream.
+        let mut writer = arrow_csv::WriterBuilder::new()
+            .with_header(false)
+            .build(&mut buf);
+
+        writer
+            .write(batch)
             .map_err(|e| format!("Failed to write CSV: {}", e))?;
     }
     Ok(buf)

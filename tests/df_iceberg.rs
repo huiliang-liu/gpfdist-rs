@@ -31,9 +31,7 @@ mod iceberg_tests {
         stream.read_to_string(&mut response).unwrap();
 
         // Should get an error since iceberg is not fully implemented
-        assert!(
-            response.starts_with("HTTP/1.1 500") || response.contains("not fully implemented")
-        );
+        assert!(response.starts_with("HTTP/1.1 500") || response.contains("not fully implemented"));
 
         drop(server_handle);
     }

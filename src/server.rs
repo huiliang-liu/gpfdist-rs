@@ -1,11 +1,12 @@
 use crate::df_engine::{DFEngine, DFRequest, TableType};
 use crate::util::{parse_query_map, percent_decode};
+use bytes::BytesMut;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use bytes::BytesMut;
 
 /// Create a unique table name for each request to avoid collisions
 /// Format: {source}_seg{sid}_{nanos}
@@ -13,15 +14,15 @@ use bytes::BytesMut;
 fn make_unique_table_name(source: &str, segid: Option<usize>) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Failed to get current system time for generating unique table name. Check system clock settings.")
+        .expect("Failed to get current system time")
         .as_nanos();
-    
+
     let sid = segid.unwrap_or(0);
     let sanitized_source: String = source
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect();
-    
+
     format!("{}_seg{}_{}", sanitized_source, sid, nanos)
 }
 
@@ -45,7 +46,7 @@ impl Server {
         loop {
             let (socket, _) = listener.accept().await?;
             let df_engine = Arc::clone(&self.df_engine);
-            
+
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(socket, df_engine).await {
                     eprintln!("Error handling connection: {}", e);
@@ -61,14 +62,14 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0; 8192];
     let n = socket.read(&mut buf).await?;
-    
+
     if n == 0 {
         return Ok(());
     }
 
     let request = String::from_utf8_lossy(&buf[..n]);
     let lines: Vec<&str> = request.lines().collect();
-    
+
     if lines.is_empty() {
         send_error(&mut socket, 400, "Bad Request").await?;
         return Ok(());
@@ -98,9 +99,7 @@ async fn handle_connection(
     }
 
     // Parse X-GP-PROTO header
-    let gp_proto = headers
-        .get("x-gp-proto")
-        .and_then(|s| s.parse::<u8>().ok());
+    let gp_proto = headers.get("x-gp-proto").and_then(|s| s.parse::<u8>().ok());
 
     // Enforce X-GP-PROTO protocol mapping rules
     match method {
@@ -110,10 +109,10 @@ async fn handle_connection(
                 Some(1) => {
                     // Valid GET with gp_proto=1
                     if path.starts_with("/df/") {
-                        handle_df_route(&mut socket, path, &headers, df_engine).await?;
+                        handle_df_route(socket, path, &headers, df_engine).await?;
                     } else {
                         // Fallback file serving for non-/df/ paths
-                        handle_file_route(&mut socket, path).await?;
+                        handle_file_route(socket, path).await?;
                     }
                 }
                 _ => {
@@ -145,7 +144,7 @@ async fn handle_connection(
 }
 
 async fn handle_df_route(
-    socket: &mut TcpStream,
+    socket: TcpStream,
     path: &str,
     headers: &std::collections::HashMap<String, String>,
     df_engine: Arc<DFEngine>,
@@ -153,14 +152,17 @@ async fn handle_df_route(
     // Extract source type from path: /df/{source}
     let path_without_query = path.split('?').next().unwrap_or(path);
     let parts: Vec<&str> = path_without_query.split('/').collect();
-    
+
+    // Need a mutable socket for sending error responses before wrapping in BufWriter
+    let mut raw_socket = socket;
+
     if parts.len() < 3 {
-        send_error(socket, 400, "Invalid /df/ route").await?;
+        send_error(&mut raw_socket, 400, "Invalid /df/ route").await?;
         return Ok(());
     }
 
     let source = parts[2];
-    
+
     // Parse table type
     let table_type = match source {
         "parquet" => TableType::Parquet,
@@ -168,25 +170,25 @@ async fn handle_df_route(
         "delta" => TableType::Delta,
         #[cfg(not(feature = "delta"))]
         "delta" => {
-            send_error(socket, 400, "Delta feature not enabled").await?;
+            send_error(&mut raw_socket, 400, "Delta feature not enabled").await?;
             return Ok(());
         }
         #[cfg(feature = "iceberg")]
         "iceberg" => TableType::Iceberg,
         #[cfg(not(feature = "iceberg"))]
         "iceberg" => {
-            send_error(socket, 400, "Iceberg feature not enabled").await?;
+            send_error(&mut raw_socket, 400, "Iceberg feature not enabled").await?;
             return Ok(());
         }
         _ => {
-            send_error(socket, 400, "Unknown source type").await?;
+            send_error(&mut raw_socket, 400, "Unknown source type").await?;
             return Ok(());
         }
     };
 
     // Parse query parameters
     let query_map = parse_query_map(path);
-    
+
     // Extract parameters
     let uri = query_map.get("path").map(|s| s.clone());
     let files_str = query_map.get("files").map(|s| s.clone());
@@ -196,7 +198,7 @@ async fn handle_df_route(
 
     // Validate: must have either path or files
     if uri.is_none() && files_str.is_none() {
-        send_error(socket, 400, "Missing 'path' or 'files' parameter").await?;
+        send_error(&mut raw_socket, 400, "Missing 'path' or 'files' parameter").await?;
         return Ok(());
     }
 
@@ -229,7 +231,7 @@ async fn handle_df_route(
         .unwrap_or(0);
 
     if gp_proto > 1 {
-        send_error(socket, 400, "Invalid X-GP-PROTO (must be 0 or 1)").await?;
+        send_error(&mut raw_socket, 400, "Invalid X-GP-PROTO (must be 0 or 1)").await?;
         return Ok(());
     }
 
@@ -242,7 +244,6 @@ async fn handle_df_route(
         .and_then(|s| s.parse::<usize>().ok());
 
     // Generate unique table name for directory mode (when uri is provided but file_list is not)
-    // This prevents "table already exists" errors when multiple concurrent requests arrive
     let table_name = if uri.is_some() && file_list.is_none() {
         Some(make_unique_table_name(source, segment_id))
     } else {
@@ -275,7 +276,11 @@ async fn handle_df_route(
                  \r\n",
                 gp_proto
             );
-            socket.write_all(response.as_bytes()).await?;
+            raw_socket.write_all(response.as_bytes()).await?;
+
+            // Optimization 1: Wrap socket in BufWriter for fewer syscalls and better throughput.
+            // Using 64KB buffer size.
+            let mut writer = BufWriter::with_capacity(64 * 1024, raw_socket);
 
             // Protocol 1 requires framing at the server layer
             if gp_proto == 1 {
@@ -290,29 +295,32 @@ async fn handle_df_route(
                         Ok(csv_bytes) => {
                             // On first batch only: emit F, O, L frames
                             if first_batch {
-                                // F frame: source label (use source type as label)
-                                socket.write_all(&frame_f(&source)).await?;
-                                
-                                // O frame: offset = 0
-                                socket.write_all(&frame_o(0)).await?;
-                                
-                                // L frame: line_no = 1
-                                socket.write_all(&frame_l(1)).await?;
-                                
+                                // Optimization 2: Write frames directly to writer without creating BytesMut intermediate buffers
+                                writer.write_all(&frame_f_bytes(&source)).await?;
+                                writer.write_all(&frame_o_bytes(0)).await?;
+                                writer.write_all(&frame_l_bytes(1)).await?;
                                 first_batch = false;
                             }
 
                             // Count lines in this batch
                             let newline_count = bytecount::count(&csv_bytes, b'\n');
-                            let rows_in_batch = if csv_bytes.is_empty() || csv_bytes[csv_bytes.len() - 1] == b'\n' {
+                            let rows_in_batch = if csv_bytes.is_empty()
+                                || csv_bytes[csv_bytes.len() - 1] == b'\n'
+                            {
                                 newline_count as u64
                             } else {
                                 // Last line doesn't end with newline, add 1
                                 newline_count as u64 + 1
                             };
 
-                            // Emit D frame with CSV data
-                            socket.write_all(&frame_d(&csv_bytes)).await?;
+                            // Optimization 3: Zero-Copy Data Framing
+                            // 1. Write the fixed 5-byte frame header
+                            let data_len = csv_bytes.len() as u32;
+                            let header = frame_hdr_bytes(b'D', data_len);
+                            writer.write_all(&header).await?;
+
+                            // 2. Write the CSV payload directly from the reference
+                            writer.write_all(&csv_bytes).await?;
 
                             // Update state
                             _offset += csv_bytes.len() as u64;
@@ -322,21 +330,23 @@ async fn handle_df_route(
                             eprintln!("Stream error: {}", e);
                             // Send error frame + EOF
                             let err_msg = format!("ERROR: {}", e);
-                            socket.write_all(&frame_e(&err_msg)).await?;
-                            socket.write_all(&frame_eof()).await?;
+                            writer.write_all(&frame_e_bytes(&err_msg)).await?;
+                            writer.write_all(&frame_eof_bytes()).await?;
+                            writer.flush().await?;
                             return Ok(());
                         }
                     }
                 }
 
                 // After stream ends: emit EOF (zero-length D frame)
-                socket.write_all(&frame_eof()).await?;
+                writer.write_all(&frame_eof_bytes()).await?;
+                writer.flush().await?;
             } else {
                 // Protocol 0: raw CSV only (no framing)
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(chunk) => {
-                            socket.write_all(&chunk).await?;
+                            writer.write_all(&chunk).await?;
                         }
                         Err(e) => {
                             eprintln!("Stream error: {}", e);
@@ -344,11 +354,17 @@ async fn handle_df_route(
                         }
                     }
                 }
+                writer.flush().await?;
             }
         }
         Err(e) => {
             eprintln!("Failed to execute query: {}", e);
-            send_error(socket, 500, &format!("Query execution failed: {}", e)).await?;
+            send_error(
+                &mut raw_socket,
+                500,
+                &format!("Query execution failed: {}", e),
+            )
+            .await?;
         }
     }
 
@@ -356,7 +372,7 @@ async fn handle_df_route(
 }
 
 async fn handle_file_route(
-    socket: &mut TcpStream,
+    mut socket: TcpStream,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Split path and query string
@@ -371,7 +387,7 @@ async fn handle_file_route(
 
     // Security: reject paths containing ".." to prevent directory traversal
     if decoded_path.contains("..") {
-        send_error(socket, 400, "Path traversal not allowed").await?;
+        send_error(&mut socket, 400, "Path traversal not allowed").await?;
         return Ok(());
     }
 
@@ -386,14 +402,18 @@ async fn handle_file_route(
     // Resolve path, the path is always relative to current working directory
     let resolved_path = std::env::current_dir()?.join(&decoded_path.trim_start_matches('/'));
 
-    // Read the file
-    let file_content = match tokio::fs::read(&resolved_path).await {
-        Ok(content) => content,
+    // Optimization: Open file for streaming instead of reading entire file into memory
+    let mut file = match File::open(&resolved_path).await {
+        Ok(f) => f,
         Err(e) => {
             // Send error frame
-            let err_msg = format!("Failed to read file: {}, error {}", resolved_path.display(), e);
+            let err_msg = format!(
+                "Failed to read file: {}, error {}",
+                resolved_path.display(),
+                e
+            );
             eprintln!("{}", err_msg);
-            
+
             // Send HTTP header with X-GP-PROTO: 1
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
@@ -403,33 +423,12 @@ async fn handle_file_route(
                  \r\n"
             );
             socket.write_all(response.as_bytes()).await?;
-            
+
             // Send E frame + EOF
-            socket.write_all(&frame_e(&err_msg)).await?;
-            socket.write_all(&frame_eof()).await?;
+            socket.write_all(&frame_e_bytes(&err_msg)).await?;
+            socket.write_all(&frame_eof_bytes()).await?;
             return Ok(());
         }
-    };
-
-    // Apply lines limit if specified
-    let final_content = if let Some(limit) = lines_limit {
-        // Find the position of the N-th newline
-        let mut line_count = 0;
-        let mut end_pos = file_content.len();
-        
-        for (i, &byte) in file_content.iter().enumerate() {
-            if byte == b'\n' {
-                line_count += 1;
-                if line_count >= limit {
-                    end_pos = i + 1; // Include the newline
-                    break;
-                }
-            }
-        }
-        
-        &file_content[..end_pos]
-    } else {
-        &file_content[..]
     };
 
     // Send HTTP header with X-GP-PROTO: 1
@@ -442,93 +441,123 @@ async fn handle_file_route(
     );
     socket.write_all(response.as_bytes()).await?;
 
-    // Send frames: F, O, L, D, EOF
-    socket.write_all(&frame_f(&decoded_path)).await?;
-    socket.write_all(&frame_o(0)).await?;
-    socket.write_all(&frame_l(1)).await?;
-    socket.write_all(&frame_d(final_content)).await?;
-    socket.write_all(&frame_eof()).await?;
+    // Use BufWriter for efficient sending
+    let mut writer = BufWriter::with_capacity(64 * 1024, socket);
+
+    // Send initial frames: F, O, L
+    writer.write_all(&frame_f_bytes(&decoded_path)).await?;
+    writer.write_all(&frame_o_bytes(0)).await?;
+    writer.write_all(&frame_l_bytes(1)).await?;
+
+    // Optimization: Stream file content using a buffer
+    let mut buf = vec![0u8; 32 * 1024]; // 32KB buffer
+    let mut lines_sent = 0;
+    let mut stop_streaming = false;
+
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break; // EOF
+        }
+
+        let mut chunk = &buf[..n];
+
+        // Handle lines limit if specified
+        if let Some(limit) = lines_limit {
+            let newlines_in_chunk = bytecount::count(chunk, b'\n');
+
+            if lines_sent + newlines_in_chunk >= limit {
+                // We have reached or exceeded the limit in this chunk
+                let needed = limit - lines_sent;
+
+                // Find the position of the 'needed'-th newline
+                let mut pos = 0;
+                let mut found = 0;
+                for (i, &b) in chunk.iter().enumerate() {
+                    if b == b'\n' {
+                        found += 1;
+                        if found == needed {
+                            pos = i + 1; // Include the newline
+                            break;
+                        }
+                    }
+                }
+
+                // Truncate the chunk
+                if pos > 0 {
+                    chunk = &buf[..pos];
+                }
+                stop_streaming = true;
+            }
+            lines_sent += newlines_in_chunk;
+        }
+
+        // Write D Frame Header
+        let header = frame_hdr_bytes(b'D', chunk.len() as u32);
+        writer.write_all(&header).await?;
+        // Write data
+        writer.write_all(chunk).await?;
+
+        if stop_streaming {
+            break;
+        }
+    }
+
+    // Send EOF Frame
+    writer.write_all(&frame_eof_bytes()).await?;
+    writer.flush().await?;
 
     Ok(())
 }
 
-// Framing helper functions for gpfdist protocol 1
-// Frame format: [type:1][length:4][line_or_offset:4][data...]
+// --- Optimized Framing Helpers (Zero-allocation for headers) ---
 
-/// Create a frame header with type, length, and line/offset
-fn frame_hdr(letter: u8, len: u32) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(9);
-    buf.extend_from_slice(&[letter]);
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(&0u32.to_be_bytes());
+/// Create a fixed 5-byte frame header array
+fn frame_hdr_bytes(letter: u8, len: u32) -> [u8; 5] {
+    let mut buf = [0u8; 5];
+    buf[0] = letter;
+    buf[1..5].copy_from_slice(&len.to_be_bytes());
     buf
 }
 
-/// Create an 'F' (filename) frame
-fn frame_f(filename: &str) -> BytesMut {
+/// Create an 'F' (filename) frame as BytesMut (still used for variable length)
+fn frame_f_bytes(filename: &str) -> BytesMut {
     let mut buf = BytesMut::with_capacity(5 + filename.len());
-    buf.extend_from_slice(&[b'F']);
-    buf.extend_from_slice(&(filename.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&frame_hdr_bytes(b'F', filename.len() as u32));
     buf.extend_from_slice(filename.as_bytes());
     buf
 }
 
-/// Create an 'O' (offset) frame
-fn frame_o(offset: u64) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(9);
-    buf.extend_from_slice(&[b'O']);
-    buf.extend_from_slice(&8u32.to_be_bytes());
-    buf.extend_from_slice(&(offset).to_be_bytes());
+/// Create an 'O' (offset) frame as BytesMut
+fn frame_o_bytes(offset: u64) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(17); // 9 header + 8 data
+                                               // Note: The protocol uses the 4-byte line_or_offset field for small offsets,
+                                               // but O frames often carry the full 64-bit offset in the data payload depending on version.
+                                               // Standard gpfdist usually puts 0 in header and 8-byte offset in data for O frames.
+    buf.extend_from_slice(&frame_hdr_bytes(b'O', 8));
+    buf.extend_from_slice(&offset.to_be_bytes());
     buf
 }
 
-/// Create an 'L' (line number) frame
-fn frame_l(line_no: u64) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(9);
-    buf.extend_from_slice(&[b'L']);
-    buf.extend_from_slice(&8u32.to_be_bytes());
-    buf.extend_from_slice(&(line_no).to_be_bytes());
+/// Create an 'L' (line number) frame as BytesMut
+fn frame_l_bytes(line_no: u64) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(17); // 9 header + 8 data
+    buf.extend_from_slice(&frame_hdr_bytes(b'L', 8));
+    buf.extend_from_slice(&line_no.to_be_bytes());
     buf
 }
 
-/// Create a 'D' (data) frame
-fn frame_d(data: &[u8]) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(5 + data.len());
-    buf.extend_from_slice(&[b'D']);
-    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    buf.extend_from_slice(data);
-    buf
-}
-
-/// Create an 'E' (error) frame
-fn frame_e(msg: &str) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(5 + msg.len());
-    buf.extend_from_slice(&[b'E']);
-    buf.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+/// Create an 'E' (error) frame as BytesMut
+fn frame_e_bytes(msg: &str) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(9 + msg.len());
+    buf.extend_from_slice(&frame_hdr_bytes(b'E', msg.len() as u32));
     buf.extend_from_slice(msg.as_bytes());
     buf
 }
 
-/// Create an EOF frame (D frame with length 0)
-fn frame_eof() -> BytesMut {
-    let mut buf = BytesMut::with_capacity(5);
-    buf.extend_from_slice(&[b'D']);
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    buf
-}
-
-async fn send_ok(socket: &mut TcpStream, body: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        body.len()
-    );
-    socket.write_all(response.as_bytes()).await?;
-    socket.write_all(body).await?;
-    Ok(())
+/// Create an EOF frame bytes
+fn frame_eof_bytes() -> [u8; 5] {
+    frame_hdr_bytes(b'D', 0)
 }
 
 async fn send_error(
@@ -543,7 +572,7 @@ async fn send_error(
         500 => "Internal Server Error",
         _ => "Error",
     };
-    
+
     let response = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: text/plain\r\n\
@@ -551,28 +580,11 @@ async fn send_error(
          Connection: close\r\n\
          \r\n\
          {}",
-        status, status_text, message.len(), message
+        status,
+        status_text,
+        message.len(),
+        message
     );
     socket.write_all(response.as_bytes()).await?;
     Ok(())
-}
-
-/// Truncate data to the first N lines (newline-terminated)
-fn truncate_to_lines(data: &[u8], lines: usize) -> Vec<u8> {
-    if lines == 0 {
-        return Vec::new();
-    }
-    
-    let mut line_count = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        if byte == b'\n' {
-            line_count += 1;
-            if line_count >= lines {
-                return data[..=i].to_vec();
-            }
-        }
-    }
-    
-    // If we haven't found enough newlines, return all data
-    data.to_vec()
 }

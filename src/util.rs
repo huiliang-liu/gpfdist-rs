@@ -4,7 +4,7 @@ use std::collections::HashMap;
 /// Example: "/df/parquet?path=/data&limit=100" -> {"path": "/data", "limit": "100"}
 pub fn parse_query_map(raw_path: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    
+
     if let Some(query_start) = raw_path.find('?') {
         let query = &raw_path[query_start + 1..];
         for pair in query.split('&') {
@@ -15,7 +15,7 @@ pub fn parse_query_map(raw_path: &str) -> HashMap<String, String> {
             }
         }
     }
-    
+
     map
 }
 
@@ -23,7 +23,7 @@ pub fn parse_query_map(raw_path: &str) -> HashMap<String, String> {
 pub fn percent_decode(s: &str) -> String {
     let mut result = String::new();
     let mut chars = s.chars();
-    
+
     while let Some(ch) = chars.next() {
         if ch == '%' {
             // Try to decode the next two characters as hex
@@ -41,7 +41,7 @@ pub fn percent_decode(s: &str) -> String {
             result.push(ch);
         }
     }
-    
+
     result
 }
 

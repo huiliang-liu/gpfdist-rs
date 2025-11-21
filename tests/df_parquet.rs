@@ -156,7 +156,8 @@ async fn test_parquet_proto_1_async() {
         }
 
         let frame_type = frames[i];
-        let length = u32::from_be_bytes([frames[i + 1], frames[i + 2], frames[i + 3], frames[i + 4]]);
+        let length =
+            u32::from_be_bytes([frames[i + 1], frames[i + 2], frames[i + 3], frames[i + 4]]);
 
         match frame_type {
             b'F' => i += 9,
@@ -232,10 +233,7 @@ async fn test_parquet_with_filter_async() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Filter: id > 1
-    let url = format!(
-        "files={}&filter=id%20%3E%201",
-        file_path.to_str().unwrap()
-    );
+    let url = format!("files={}&filter=id%20%3E%201", file_path.to_str().unwrap());
     let request = format!(
         "GET /df/parquet?{} HTTP/1.1\r\n\
          Host: localhost:18080\r\n\
@@ -305,7 +303,10 @@ fn create_test_parquet_file(path: &std::path::Path) -> Result<(), Box<dyn std::e
     let id_array = Int32Array::from(vec![1, 2, 3]);
     let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
 
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array), Arc::new(name_array)])?;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(id_array), Arc::new(name_array)],
+    )?;
 
     let file = File::create(path)?;
     let mut writer = ArrowWriter::try_new(file, schema, None)?;
