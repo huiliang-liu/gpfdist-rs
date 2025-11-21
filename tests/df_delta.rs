@@ -3,8 +3,6 @@ mod delta_tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use deltalake::writer::{DeltaWriter, RecordBatchWriter};
-    use deltalake::DeltaTableBuilder;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
@@ -80,14 +78,11 @@ mod delta_tests {
             vec![Arc::new(id_array), Arc::new(name_array)],
         )?;
 
-        // Create delta table
-        let table = DeltaTableBuilder::from_uri(path.to_str().unwrap())
-            .build()
+        // Use DeltaOps to create and write to delta table
+        let ops = deltalake::DeltaOps::try_from_uri(path.to_str().unwrap()).await?;
+        ops.write(vec![batch])
+            .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
             .await?;
-
-        let mut writer = RecordBatchWriter::for_table(&table)?;
-        writer.write(batch).await?;
-        writer.flush_and_commit(&table).await?;
 
         Ok(())
     }
