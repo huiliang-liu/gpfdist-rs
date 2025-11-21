@@ -2,11 +2,134 @@ use crate::df_engine::{DFEngine, DFRequest, TableType};
 use crate::util::{parse_query_map, percent_decode};
 use bytes::BytesMut;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+
+// --- Session Management ---
+
+/// Session key identifying a unique logical session based on gpfdist protocol headers
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SessionKey {
+    xid: String,
+    cid: String,
+    sn: String,
+}
+
+/// Session state tracking
+#[derive(Debug, Clone)]
+enum SessionStatus {
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+struct SessionState {
+    status: SessionStatus,
+    #[allow(dead_code)]
+    started_at: Instant,
+    completed_at: Option<Instant>,
+}
+
+/// Global session manager to track sessions across requests
+struct SessionManager {
+    sessions: Mutex<HashMap<SessionKey, SessionState>>,
+}
+
+impl SessionManager {
+    fn new() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Check if a session exists and return its status
+    async fn get_session_status(&self, key: &SessionKey) -> Option<SessionStatus> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(key).map(|state| state.status.clone())
+    }
+
+    /// Mark a session as in-progress
+    async fn mark_in_progress(&self, key: SessionKey) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(
+            key,
+            SessionState {
+                status: SessionStatus::InProgress,
+                started_at: Instant::now(),
+                completed_at: None,
+            },
+        );
+    }
+
+    /// Mark a session as completed
+    async fn mark_completed(&self, key: &SessionKey) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(state) = sessions.get_mut(key) {
+            state.status = SessionStatus::Completed;
+            state.completed_at = Some(Instant::now());
+        }
+    }
+
+    /// Evict old completed sessions (TTL-based cleanup)
+    /// Remove sessions completed more than the given duration ago
+    async fn evict_old_sessions(&self, ttl: Duration) {
+        let mut sessions = self.sessions.lock().await;
+        let now = Instant::now();
+        sessions.retain(|_key, state| {
+            if let SessionStatus::Completed = state.status {
+                if let Some(completed_at) = state.completed_at {
+                    // Keep if not yet expired
+                    return now.duration_since(completed_at) < ttl;
+                }
+            }
+            // Keep InProgress sessions
+            true
+        });
+    }
+}
+
+// Global static session manager
+static SESSION_MANAGER: once_cell::sync::Lazy<SessionManager> =
+    once_cell::sync::Lazy::new(|| SessionManager::new());
+
+/// Extract session key from headers (X-GP-XID, X-GP-CID, X-GP-SN)
+fn extract_session_key(headers: &std::collections::HashMap<String, String>) -> Option<SessionKey> {
+    let xid = headers.get("x-gp-xid")?.clone();
+    let cid = headers.get("x-gp-cid")?.clone();
+    let sn = headers.get("x-gp-sn")?.clone();
+    Some(SessionKey { xid, cid, sn })
+}
+
+/// Send an immediate EOF response for cached/completed sessions
+async fn send_immediate_eof_response(
+    socket: &mut TcpStream,
+    gp_proto: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Send HTTP OK header
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         X-GP-PROTO: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        gp_proto
+    );
+    socket.write_all(response.as_bytes()).await?;
+
+    // For protocol 1, send minimal framing (just EOF)
+    if gp_proto == 1 {
+        // Send EOF frame (zero-length D frame)
+        socket.write_all(&frame_eof_bytes()).await?;
+    }
+    // For protocol 0, just close connection (no data)
+
+    Ok(())
+}
 
 /// Create a unique table name for each request to avoid collisions
 /// Format: {source}_seg{sid}_{nanos}
@@ -243,6 +366,56 @@ async fn handle_df_route(
         .get("x-gp-segment-count")
         .and_then(|s| s.parse::<usize>().ok());
 
+    // Session management: Extract session headers
+    let session_key = extract_session_key(headers);
+
+    // Session-aware data sources: delta, iceberg (but not parquet with explicit file list)
+    // Parquet with file_list uses segmentation on file list, so no session caching
+    let use_session_caching = match table_type {
+        #[cfg(feature = "delta")]
+        TableType::Delta => file_list.is_none(),
+        #[cfg(feature = "iceberg")]
+        TableType::Iceberg => file_list.is_none(),
+        TableType::Parquet => false, // Parquet uses file-level segmentation
+        #[cfg(all(not(feature = "delta"), not(feature = "iceberg")))]
+        _ => false,
+    };
+
+    // If session headers are present and this source supports session caching, check session state
+    if let Some(key) = &session_key {
+        if use_session_caching {
+            // Perform TTL eviction on each request (opportunistic cleanup)
+            SESSION_MANAGER
+                .evict_old_sessions(Duration::from_secs(5 * 60))
+                .await;
+
+            // Check if session already exists
+            if let Some(status) = SESSION_MANAGER.get_session_status(key).await {
+                match status {
+                    SessionStatus::InProgress => {
+                        // Session is in progress by another request; return immediate EOF
+                        eprintln!(
+                            "Session {:?} already in progress, returning immediate EOF",
+                            key
+                        );
+                        send_immediate_eof_response(&mut raw_socket, gp_proto).await?;
+                        return Ok(());
+                    }
+                    SessionStatus::Completed => {
+                        // Session already completed; return immediate EOF
+                        eprintln!("Session {:?} already completed, returning immediate EOF", key);
+                        send_immediate_eof_response(&mut raw_socket, gp_proto).await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                // New session: mark as in-progress
+                eprintln!("New session {:?}, marking as in-progress", key);
+                SESSION_MANAGER.mark_in_progress(key.clone()).await;
+            }
+        }
+    }
+
     // Generate unique table name for directory mode (when uri is provided but file_list is not)
     let table_name = if uri.is_some() && file_list.is_none() {
         Some(make_unique_table_name(source, segment_id))
@@ -355,6 +528,14 @@ async fn handle_df_route(
                     }
                 }
                 writer.flush().await?;
+            }
+
+            // Mark session as completed after successful streaming
+            if let Some(key) = &session_key {
+                if use_session_caching {
+                    eprintln!("Session {:?} completed successfully", key);
+                    SESSION_MANAGER.mark_completed(key).await;
+                }
             }
         }
         Err(e) => {
