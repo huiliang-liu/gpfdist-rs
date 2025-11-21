@@ -79,6 +79,7 @@ Query tabular data where `{source}` is one of:
 ## Documentation
 
 For detailed documentation, see:
+- [Architecture Overview](docs/architecture.md)
 - [DataFusion Integration Guide](docs/datafusion.md)
 
 ## Testing
