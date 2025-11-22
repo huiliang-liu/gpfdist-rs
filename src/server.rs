@@ -194,11 +194,11 @@ fn get_slice_thresholds() -> (usize, usize) {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     
-    // Fallback to bytes threshold (default 8 MiB)
+    // Fallback to bytes threshold (default 1 MB)
     let target_bytes = std::env::var("GPFDIST_SEGMENT_TARGET_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8 * 1024 * 1024);
+        .unwrap_or(1024 * 1024);
     
     // If lines threshold is set, use it; otherwise use bytes
     if target_lines > 0 {
@@ -584,6 +584,7 @@ async fn handle_df_route_with_session(
             SliceResult::Eof { offset, line_number } => {
                 if gp_proto == 1 {
                     // Write F/O/L + EOF (D with length 0)
+                    eprintln!("Sending EOF frame: F/O/L + EOF at offset {}, line {}", offset, line_number);
                     writer.write_all(&frame_f_bytes(&source)).await?;
                     writer.write_all(&frame_o_bytes(offset)).await?;
                     writer.write_all(&frame_l_bytes(line_number)).await?;
@@ -759,7 +760,7 @@ async fn distribute_slice_to_sink(
                 let sink = &guard.pending_queue[idx];
                 (sink.finished, sink.target_bytes, sink.target_lines, sink.tx.clone())
             };
-            let (sink_finished, target_bytes, target_lines, tx) = sink_info;
+            let (sink_finished, _target_bytes, _target_lines, tx) = sink_info;
             
             if !sink_finished {
                 // Calculate slice metrics
@@ -778,25 +779,6 @@ async fn distribute_slice_to_sink(
                     let sink = &mut guard.pending_queue[idx];
                     sink.bytes_assigned += slice_bytes;
                     sink.lines_assigned += slice_lines;
-                    let bytes_assigned = sink.bytes_assigned;
-                    let lines_assigned = sink.lines_assigned;
-
-                    // Check if threshold reached
-                    let threshold_reached = 
-                        (target_bytes > 0 && bytes_assigned >= target_bytes) ||
-                        (target_lines > 0 && lines_assigned >= target_lines);
-
-                    if threshold_reached {
-                        // This sink is done with its slice - send EOF and move to next
-                        let eof = SliceResult::Eof {
-                            offset: guard.next_offset,
-                            line_number: guard.next_line,
-                        };
-                        // Use the cloned tx to send EOF
-                        let _ = tx.send(eof).await;
-                        guard.pending_queue[idx].finished = true;
-                        guard.active_sink_index = None;
-                    }
                     return true;
                 } else {
                     // Sink disconnected - mark as finished
@@ -945,6 +927,8 @@ async fn handle_df_route_direct(
                     }
                 }
                 // Final EOF packet
+                println!("Sending final EOF frame: F/O/L + EOF at offset {}, line {}", offset, line_no);
+
                 writer.write_all(&frame_f_bytes(source)).await?;
                 writer.write_all(&frame_o_bytes(offset)).await?;
                 writer.write_all(&frame_l_bytes(line_no)).await?;
