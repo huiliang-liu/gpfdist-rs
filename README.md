@@ -81,6 +81,7 @@ Query tabular data where `{source}` is one of:
 For detailed documentation, see:
 - [Architecture Overview](docs/architecture.md)
 - [DataFusion Integration Guide](docs/datafusion.md)
+- [Protocol Specification](PROTOCOL.md) - gpfdist framing protocol details
 
 ## Testing
 
@@ -120,12 +121,14 @@ tests/
 |---------|-------------|--------------|
 | `delta` | Enable Delta Lake support | deltalake |
 | `iceberg` | Enable Iceberg support | iceberg-rust |
+| `compact-meta` | Legacy mode: emit F/O/L only for first packet + EOF | none |
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GPFDIST_ADDR` | `0.0.0.0:8080` | Server bind address |
+| `GPFDIST_SESSION_REPEAT_ERROR` | `false` | Include cached error in repeat session responses |
 
 ## Performance
 

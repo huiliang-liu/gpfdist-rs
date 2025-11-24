@@ -32,6 +32,7 @@ enum SessionStatus {
 struct SessionState {
     status: SessionStatus,
     reader_claimed: bool, // true if a request is performing the primary read
+    #[allow(dead_code)] // Used for session eviction tracking
     started_at: Instant,
     completed_at: Option<Instant>,
     error_message: Option<String>, // Cache first error for repeat responses
@@ -154,9 +155,12 @@ fn session_repeat_error_frame() -> bool {
 
 // When true, emit F/O/L only for first packet + EOF (legacy behavior)
 // When false (default), emit F/O/L before each packet (strict gpfdist)
+// Note: Currently constant; future enhancement could make this runtime configurable
 #[cfg(feature = "compact-meta")]
+#[allow(dead_code)] // Reserved for future compact-meta implementation
 const COMPACT_META_MODE: bool = true;
 #[cfg(not(feature = "compact-meta"))]
+#[allow(dead_code)] // Reserved for future compact-meta implementation
 const COMPACT_META_MODE: bool = false;
 
 // ---------------- Utility ----------------
