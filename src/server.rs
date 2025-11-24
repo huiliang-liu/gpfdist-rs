@@ -32,9 +32,9 @@ enum SessionStatus {
 struct SessionState {
     status: SessionStatus,
     reader_claimed: bool, // true if a request is performing the primary read
-    #[allow(dead_code)] // Used for session eviction tracking
+    #[allow(dead_code)] // Reserved for future use (e.g., timeout detection for in-progress sessions)
     started_at: Instant,
-    completed_at: Option<Instant>,
+    completed_at: Option<Instant>, // Used for session eviction TTL
     error_message: Option<String>, // Cache first error for repeat responses
     logical_name: Option<String>, // Original source/path for consistent short-circuit responses
 }
@@ -155,12 +155,13 @@ fn session_repeat_error_frame() -> bool {
 
 // When true, emit F/O/L only for first packet + EOF (legacy behavior)
 // When false (default), emit F/O/L before each packet (strict gpfdist)
-// Note: Currently constant; future enhancement could make this runtime configurable
+// TODO: Implement conditional framing logic in write_data_packet based on this flag
+// For now, always uses per-packet meta frames regardless of feature flag
 #[cfg(feature = "compact-meta")]
-#[allow(dead_code)] // Reserved for future compact-meta implementation
+#[allow(dead_code)] // TODO: Use in write_data_packet for conditional framing
 const COMPACT_META_MODE: bool = true;
 #[cfg(not(feature = "compact-meta"))]
-#[allow(dead_code)] // Reserved for future compact-meta implementation
+#[allow(dead_code)] // TODO: Use in write_data_packet for conditional framing
 const COMPACT_META_MODE: bool = false;
 
 // ---------------- Utility ----------------

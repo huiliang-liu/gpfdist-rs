@@ -253,16 +253,19 @@ async fn test_line_number_counting() {
 
     // Find the EOF packet (last F O L D with zero-length D)
     let mut eof_line_no = 0u64;
-    let mut i = frames.len();
     
-    while i >= 4 {
-        i -= 1;
-        if frames[i].frame_type == b'D' && frames[i].data.is_empty() {
-            // Found EOF, get line number from L frame (should be 2 positions back)
-            if i >= 2 && frames[i - 1].frame_type == b'L' {
-                let line_bytes: [u8; 8] = frames[i - 1].data.as_slice().try_into().unwrap();
-                eof_line_no = u64::from_be_bytes(line_bytes);
-                break;
+    // Search backwards, ensuring we have at least 4 frames
+    if frames.len() >= 4 {
+        let mut i = frames.len();
+        while i >= 4 {
+            i -= 1;
+            if frames[i].frame_type == b'D' && frames[i].data.is_empty() {
+                // Found EOF, get line number from L frame (should be 2 positions back)
+                if i >= 2 && frames[i - 1].frame_type == b'L' {
+                    let line_bytes: [u8; 8] = frames[i - 1].data.as_slice().try_into().unwrap();
+                    eof_line_no = u64::from_be_bytes(line_bytes);
+                    break;
+                }
             }
         }
     }
