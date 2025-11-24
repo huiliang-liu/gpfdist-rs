@@ -44,7 +44,7 @@ enum SessionDecision {
 }
 
 struct SessionManager {
-    sessions: Mutex<HashMap<SessionKey, SessionState>>,
+    sessions: Mutex<HashMap<SessionKey, SessionState>>, 
 }
 
 impl SessionManager {
@@ -145,11 +145,10 @@ async fn send_immediate_eof_response(
     );
     socket.write_all(response.as_bytes()).await?;
     if gp_proto == 1 {
-        if INCLUDE_META_ON_REPEAT {
-            socket.write_all(&frame_f_bytes("repeat_session")).await?;
-            socket.write_all(&frame_o_bytes(0)).await?;
-            socket.write_all(&frame_l_bytes(1)).await?;
-        }
+        // Always include meta frames then EOF zero-length D frame (per requirement all packets F/O/L/D)
+        socket.write_all(&frame_f_bytes("repeat_session")).await?;
+        socket.write_all(&frame_o_bytes(0)).await?;
+        socket.write_all(&frame_l_bytes(1)).await?;
         socket.write_all(&frame_eof_bytes()).await?;
     }
     Ok(())
@@ -178,7 +177,7 @@ impl Server {
             let eng = Arc::clone(&self.df_engine);
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(socket, eng).await {
-                    eprintln!("connection error: {e}");
+                    eprintln!("connection error: {{e}}{}");
                 }
             });
         }
@@ -230,7 +229,7 @@ async fn handle_connection(
             headers.insert(line[..p].trim().to_lowercase(), line[p + 1..].trim().to_string());
         }
     }
-    eprintln!("DEBUG headers: {:?}", headers);
+    eprintln!("DEBUG headers: {{:?}}{:?}", headers);
 
     let gp_proto = headers.get("x-gp-proto").and_then(|v| v.parse::<u8>().ok());
 
@@ -402,49 +401,48 @@ async fn handle_df_route(
             let mut writer = BufWriter::with_capacity(64 * 1024, raw_socket);
 
             if gp_proto == 1 {
-                let mut first_batch = true;
-                let mut _offset: u64 = 0;
-                let mut _line_no: u64 = 1;
+                let mut offset: u64 = 0;
+                let mut line_no: u64 = 1; // first line number before writing any data
 
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(csv_bytes) => {
-                            if first_batch {
-                                writer.write_all(&frame_f_bytes(source)).await?;
-                                writer.write_all(&frame_o_bytes(0)).await?;
-                                writer.write_all(&frame_l_bytes(1)).await?;
-                                first_batch = false;
-                            }
+                            // Emit meta frames BEFORE each D frame (F/O/L), using current offset & line_no
+                            writer.write_all(&frame_f_bytes(source)).await?;
+                            writer.write_all(&frame_o_bytes(offset)).await?;
+                            writer.write_all(&frame_l_bytes(line_no)).await?;
 
                             let header = frame_hdr_bytes(b'D', csv_bytes.len() as u32);
                             writer.write_all(&header).await?;
                             writer.write_all(&csv_bytes).await?;
 
-                            _offset += csv_bytes.len() as u64;
+                            // Update offset & line_no for next packet
+                            offset += csv_bytes.len() as u64;
                             let newline_count = bytecount::count(&csv_bytes, b'\n') as u64;
-                            let extra_line =
-                                if !csv_bytes.is_empty() && *csv_bytes.last().unwrap() != b'\n' {
-                                    1
-                                } else {
-                                    0
-                                };
-                            _line_no += newline_count + extra_line;
+                            let extra_line = if !csv_bytes.is_empty() && *csv_bytes.last().unwrap() != b'\n' { 1 } else { 0 };
+                            line_no += newline_count + extra_line;
                         }
                         Err(e) => {
+                            // Error packet: send F/O/L + E + EOF (zero-length D)
+                            writer.write_all(&frame_f_bytes(source)).await?;
+                            writer.write_all(&frame_o_bytes(offset)).await?;
+                            writer.write_all(&frame_l_bytes(line_no)).await?;
                             let err_msg = format!("ERROR: {}", e);
                             writer.write_all(&frame_e_bytes(&err_msg)).await?;
+                            writer.write_all(&frame_f_bytes(source)).await?; // meta before EOF as well
+                            writer.write_all(&frame_o_bytes(offset)).await?;
+                            writer.write_all(&frame_l_bytes(line_no)).await?;
                             writer.write_all(&frame_eof_bytes()).await?;
                             writer.flush().await?;
-                            if let Some(key) = &session_key {
-                                if use_session_caching {
-                                    SESSION_MANAGER.mark_completed(key).await;
-                                }
-                            }
+                            if let Some(key) = &session_key { if use_session_caching { SESSION_MANAGER.mark_completed(key).await; } }
                             return Ok(());
                         }
                     }
                 }
-
+                // Final EOF packet also includes meta frames
+                writer.write_all(&frame_f_bytes(source)).await?;
+                writer.write_all(&frame_o_bytes(offset)).await?;
+                writer.write_all(&frame_l_bytes(line_no)).await?;
                 writer.write_all(&frame_eof_bytes()).await?;
                 writer.flush().await?;
             } else {
@@ -456,24 +454,11 @@ async fn handle_df_route(
                 writer.flush().await?;
             }
 
-            if let Some(key) = &session_key {
-                if use_session_caching {
-                    SESSION_MANAGER.mark_completed(key).await;
-                }
-            }
+            if let Some(key) = &session_key { if use_session_caching { SESSION_MANAGER.mark_completed(key).await; } }
         }
         Err(e) => {
-            send_error(
-                &mut raw_socket,
-                500,
-                &format!("Query execution failed: {}", e),
-            )
-            .await?;
-            if let Some(key) = &session_key {
-                if use_session_caching {
-                    SESSION_MANAGER.mark_completed(key).await;
-                }
-            }
+            send_error(&mut raw_socket, 500, &format!("Query execution failed: {}", e)).await?;
+            if let Some(key) = &session_key { if use_session_caching { SESSION_MANAGER.mark_completed(key).await; } }
         }
     }
 
@@ -511,77 +496,77 @@ async fn handle_file_route(
     let mut file = match File::open(&resolved_path).await {
         Ok(f) => f,
         Err(e) => {
-            let err_msg = format!(
-                "Failed to read file: {}, error {}",
-                resolved_path.display(),
-                e
-            );
+            let err_msg = format!("Failed to read file: {}, error {}", resolved_path.display(), e);
             eprintln!("{}", err_msg);
-
-            let response =
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await?;
+            // Error packet
+            socket.write_all(&frame_f_bytes(&decoded_path)).await?;
+            socket.write_all(&frame_o_bytes(0)).await?;
+            socket.write_all(&frame_l_bytes(1)).await?;
             socket.write_all(&frame_e_bytes(&err_msg)).await?;
+            // EOF packet
+            socket.write_all(&frame_f_bytes(&decoded_path)).await?;
+            socket.write_all(&frame_o_bytes(0)).await?;
+            socket.write_all(&frame_l_bytes(1)).await?;
             socket.write_all(&frame_eof_bytes()).await?;
             return Ok(());
         }
     };
 
-    let response =
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
+    let response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
     socket.write_all(response.as_bytes()).await?;
 
     let mut writer = BufWriter::with_capacity(64 * 1024, socket);
 
-    writer.write_all(&frame_f_bytes(&decoded_path)).await?;
-    writer.write_all(&frame_o_bytes(0)).await?;
-    writer.write_all(&frame_l_bytes(1)).await?;
-
+    let mut offset: u64 = 0;
+    let mut line_no: u64 = 1;
     let mut buf = vec![0u8; 32 * 1024];
     let mut lines_sent = 0;
     let mut stop_streaming = false;
 
     loop {
         let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-
+        if n == 0 { break; }
         let mut chunk = &buf[..n];
 
         if let Some(limit) = lines_limit {
             let newlines_in_chunk = bytecount::count(chunk, b'\n');
             if lines_sent + newlines_in_chunk >= limit {
                 let needed = limit - lines_sent;
-                let mut pos = 0;
-                let mut found = 0;
+                let mut pos = 0; let mut found = 0;
                 for (i, &b) in chunk.iter().enumerate() {
-                    if b == b'\n' {
-                        found += 1;
-                        if found == needed {
-                            pos = i + 1;
-                            break;
-                        }
-                    }
+                    if b == b'\n' { found += 1; if found == needed { pos = i + 1; break; } }
                 }
-                if pos > 0 {
-                    chunk = &chunk[..pos];
-                }
+                if pos > 0 { chunk = &chunk[..pos]; }
                 stop_streaming = true;
             }
             lines_sent += newlines_in_chunk;
         }
 
+        // Meta frames before each D frame
+        writer.write_all(&frame_f_bytes(&decoded_path)).await?;
+        writer.write_all(&frame_o_bytes(offset)).await?;
+        writer.write_all(&frame_l_bytes(line_no)).await?;
+
         let header = frame_hdr_bytes(b'D', chunk.len() as u32);
         writer.write_all(&header).await?;
         writer.write_all(chunk).await?;
 
-        if stop_streaming {
-            break;
-        }
+        offset += chunk.len() as u64;
+        let newline_count = bytecount::count(chunk, b'\n') as u64;
+        let extra_line = if !chunk.is_empty() && chunk[chunk.len()-1] != b'\n' { 1 } else { 0 };
+        line_no += newline_count + extra_line;
+
+        if stop_streaming { break; }
     }
 
+    // EOF packet with meta frames
+    writer.write_all(&frame_f_bytes(&decoded_path)).await?;
+    writer.write_all(&frame_o_bytes(offset)).await?;
+    writer.write_all(&frame_l_bytes(line_no)).await?;
     writer.write_all(&frame_eof_bytes()).await?;
+
     writer.flush().await?;
     Ok(())
 }
@@ -623,9 +608,7 @@ fn frame_e_bytes(msg: &str) -> BytesMut {
     buf
 }
 
-fn frame_eof_bytes() -> [u8; 5] {
-    frame_hdr_bytes(b'D', 0)
-}
+fn frame_eof_bytes() -> [u8; 5] { frame_hdr_bytes(b'D', 0) }
 
 // ---------------- Error Response ----------------
 
