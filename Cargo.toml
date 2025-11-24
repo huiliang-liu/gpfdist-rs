@@ -7,6 +7,7 @@ edition = "2021"
 default = []
 delta = ["deltalake"]
 iceberg = ["iceberg-rust"]
+compact-meta = []  # Emit F/O/L only for first packet + EOF (legacy mode)
 
 [dependencies]
 # Core async runtime

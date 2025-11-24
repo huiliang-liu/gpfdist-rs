@@ -34,6 +34,8 @@ struct SessionState {
     reader_claimed: bool, // true if a request is performing the primary read
     started_at: Instant,
     completed_at: Option<Instant>,
+    error_message: Option<String>, // Cache first error for repeat responses
+    logical_name: Option<String>, // Original source/path for consistent short-circuit responses
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +78,8 @@ impl SessionManager {
                         reader_claimed: true,
                         started_at: Instant::now(),
                         completed_at: None,
+                        error_message: None,
+                        logical_name: None,
                     },
                 );
                 SessionDecision::StartRead
@@ -89,6 +93,27 @@ impl SessionManager {
             state.status = SessionStatus::Completed;
             state.completed_at = Some(Instant::now());
         }
+    }
+
+    async fn set_logical_name(&self, key: &SessionKey, name: String) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(state) = sessions.get_mut(key) {
+            state.logical_name = Some(name);
+        }
+    }
+
+    async fn set_error_message(&self, key: &SessionKey, error: String) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(state) = sessions.get_mut(key) {
+            if state.error_message.is_none() {
+                state.error_message = Some(error);
+            }
+        }
+    }
+
+    async fn get_session_info(&self, key: &SessionKey) -> Option<(Option<String>, Option<String>)> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(key).map(|state| (state.logical_name.clone(), state.error_message.clone()))
     }
 
     async fn evict_old_sessions(&self, ttl: Duration) {
@@ -117,7 +142,22 @@ fn extract_session_key(headers: &HashMap<String, String>) -> Option<SessionKey> 
     })
 }
 
-const INCLUDE_META_ON_REPEAT: bool = true;
+// ---------------- Configuration ----------------
+
+// When true, repeat session responses include cached error E frame + EOF
+// When false, only EOF is sent for repeat sessions
+fn session_repeat_error_frame() -> bool {
+    std::env::var("GPFDIST_SESSION_REPEAT_ERROR").ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(false)
+}
+
+// When true, emit F/O/L only for first packet + EOF (legacy behavior)
+// When false (default), emit F/O/L before each packet (strict gpfdist)
+#[cfg(feature = "compact-meta")]
+const COMPACT_META_MODE: bool = true;
+#[cfg(not(feature = "compact-meta"))]
+const COMPACT_META_MODE: bool = false;
 
 // ---------------- Utility ----------------
 
@@ -138,6 +178,7 @@ fn make_unique_table_name(source: &str, segid: Option<usize>) -> String {
 async fn send_immediate_eof_response(
     socket: &mut TcpStream,
     gp_proto: u8,
+    session_key: &SessionKey,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: {}\r\nConnection: close\r\n\r\n",
@@ -145,8 +186,30 @@ async fn send_immediate_eof_response(
     );
     socket.write_all(response.as_bytes()).await?;
     if gp_proto == 1 {
-        // Always include meta frames then EOF zero-length D frame (per requirement all packets F/O/L/D)
-        socket.write_all(&frame_f_bytes("repeat_session")).await?;
+        // Get session info for logical name and error message
+        let (logical_name, error_msg) = SESSION_MANAGER.get_session_info(session_key).await
+            .unwrap_or((None, None));
+        
+        let filename = logical_name.as_deref().unwrap_or("repeat_session");
+        
+        // If error cached and feature enabled, send error packet
+        if session_repeat_error_frame() {
+            if let Some(err_msg) = error_msg {
+                // Send meta + E frame + meta + EOF for cached error
+                socket.write_all(&frame_f_bytes(filename)).await?;
+                socket.write_all(&frame_o_bytes(0)).await?;
+                socket.write_all(&frame_l_bytes(1)).await?;
+                socket.write_all(&frame_e_bytes(&err_msg)).await?;
+                socket.write_all(&frame_f_bytes(filename)).await?;
+                socket.write_all(&frame_o_bytes(0)).await?;
+                socket.write_all(&frame_l_bytes(1)).await?;
+                socket.write_all(&frame_eof_bytes()).await?;
+                return Ok(());
+            }
+        }
+        
+        // Normal EOF response: meta + zero-length D
+        socket.write_all(&frame_f_bytes(filename)).await?;
         socket.write_all(&frame_o_bytes(0)).await?;
         socket.write_all(&frame_l_bytes(1)).await?;
         socket.write_all(&frame_eof_bytes()).await?;
@@ -177,7 +240,7 @@ impl Server {
             let eng = Arc::clone(&self.df_engine);
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(socket, eng).await {
-                    eprintln!("connection error: {{e}}{}");
+                    eprintln!("connection error: {}", e);
                 }
             });
         }
@@ -229,7 +292,7 @@ async fn handle_connection(
             headers.insert(line[..p].trim().to_lowercase(), line[p + 1..].trim().to_string());
         }
     }
-    eprintln!("DEBUG headers: {{:?}}{:?}", headers);
+    eprintln!("DEBUG headers: {:?}", headers);
 
     let gp_proto = headers.get("x-gp-proto").and_then(|v| v.parse::<u8>().ok());
 
@@ -359,12 +422,12 @@ async fn handle_df_route(
                         "Session {:?} already has active reader (in-progress), short-circuit",
                         key
                     );
-                    send_immediate_eof_response(&mut raw_socket, gp_proto).await?;
+                    send_immediate_eof_response(&mut raw_socket, gp_proto, key).await?;
                     return Ok(());
                 }
                 SessionDecision::ShortCircuitCompleted => {
                     eprintln!("Session {:?} completed previously, short-circuit", key);
-                    send_immediate_eof_response(&mut raw_socket, gp_proto).await?;
+                    send_immediate_eof_response(&mut raw_socket, gp_proto, key).await?;
                     return Ok(());
                 }
             }
@@ -402,48 +465,59 @@ async fn handle_df_route(
 
             if gp_proto == 1 {
                 let mut offset: u64 = 0;
-                let mut line_no: u64 = 1; // first line number before writing any data
+                let mut line_no: u64 = 1; // first line number (1-indexed)
+                let mut last_chunk_ended_with_newline = true; // track partial line state
+                
+                // Set logical name for session short-circuit responses
+                if let Some(key) = &session_key {
+                    if use_session_caching {
+                        SESSION_MANAGER.set_logical_name(key, source.to_string()).await;
+                    }
+                }
 
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(csv_bytes) => {
-                            // Emit meta frames BEFORE each D frame (F/O/L), using current offset & line_no
-                            writer.write_all(&frame_f_bytes(source)).await?;
-                            writer.write_all(&frame_o_bytes(offset)).await?;
-                            writer.write_all(&frame_l_bytes(line_no)).await?;
+                            // Write data packet with current offset and line_no
+                            write_data_packet(&mut writer, source, offset, line_no, &csv_bytes).await?;
 
-                            let header = frame_hdr_bytes(b'D', csv_bytes.len() as u32);
-                            writer.write_all(&header).await?;
-                            writer.write_all(&csv_bytes).await?;
-
-                            // Update offset & line_no for next packet
+                            // Update offset: only count CSV payload bytes
                             offset += csv_bytes.len() as u64;
+                            
+                            // Update line_no: only count completed lines
                             let newline_count = bytecount::count(&csv_bytes, b'\n') as u64;
-                            let extra_line = if !csv_bytes.is_empty() && *csv_bytes.last().unwrap() != b'\n' { 1 } else { 0 };
-                            line_no += newline_count + extra_line;
+                            line_no += newline_count;
+                            
+                            // Track if this chunk ends with newline for proper line counting
+                            last_chunk_ended_with_newline = csv_bytes.last() == Some(&b'\n');
                         }
                         Err(e) => {
-                            // Error packet: send F/O/L + E + EOF (zero-length D)
-                            writer.write_all(&frame_f_bytes(source)).await?;
-                            writer.write_all(&frame_o_bytes(offset)).await?;
-                            writer.write_all(&frame_l_bytes(line_no)).await?;
+                            // Error packet: send meta + E + meta + EOF
                             let err_msg = format!("ERROR: {}", e);
-                            writer.write_all(&frame_e_bytes(&err_msg)).await?;
-                            writer.write_all(&frame_f_bytes(source)).await?; // meta before EOF as well
-                            writer.write_all(&frame_o_bytes(offset)).await?;
-                            writer.write_all(&frame_l_bytes(line_no)).await?;
-                            writer.write_all(&frame_eof_bytes()).await?;
+                            
+                            // Cache error message in session
+                            if let Some(key) = &session_key {
+                                if use_session_caching {
+                                    SESSION_MANAGER.set_error_message(key, err_msg.clone()).await;
+                                }
+                            }
+                            
+                            write_error_packet(&mut writer, source, offset, line_no, &err_msg).await?;
+                            write_eof_packet(&mut writer, source, offset, line_no).await?;
                             writer.flush().await?;
                             if let Some(key) = &session_key { if use_session_caching { SESSION_MANAGER.mark_completed(key).await; } }
                             return Ok(());
                         }
                     }
                 }
-                // Final EOF packet also includes meta frames
-                writer.write_all(&frame_f_bytes(source)).await?;
-                writer.write_all(&frame_o_bytes(offset)).await?;
-                writer.write_all(&frame_l_bytes(line_no)).await?;
-                writer.write_all(&frame_eof_bytes()).await?;
+                
+                // At EOF: if last chunk didn't end with newline and we sent data, count the final partial line
+                if !last_chunk_ended_with_newline && offset > 0 {
+                    line_no += 1;
+                }
+                
+                // Final EOF packet includes meta frames
+                write_eof_packet(&mut writer, source, offset, line_no).await?;
                 writer.flush().await?;
             } else {
                 while let Some(chunk_result) = stream.next().await {
@@ -500,16 +574,12 @@ async fn handle_file_route(
             eprintln!("{}", err_msg);
             let response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await?;
-            // Error packet
-            socket.write_all(&frame_f_bytes(&decoded_path)).await?;
-            socket.write_all(&frame_o_bytes(0)).await?;
-            socket.write_all(&frame_l_bytes(1)).await?;
-            socket.write_all(&frame_e_bytes(&err_msg)).await?;
-            // EOF packet
-            socket.write_all(&frame_f_bytes(&decoded_path)).await?;
-            socket.write_all(&frame_o_bytes(0)).await?;
-            socket.write_all(&frame_l_bytes(1)).await?;
-            socket.write_all(&frame_eof_bytes()).await?;
+            
+            let mut writer = BufWriter::with_capacity(64 * 1024, socket);
+            // Error packet: meta + E + meta + EOF
+            write_error_packet(&mut writer, &decoded_path, 0, 1, &err_msg).await?;
+            write_eof_packet(&mut writer, &decoded_path, 0, 1).await?;
+            writer.flush().await?;
             return Ok(());
         }
     };
@@ -524,6 +594,7 @@ async fn handle_file_route(
     let mut buf = vec![0u8; 32 * 1024];
     let mut lines_sent = 0;
     let mut stop_streaming = false;
+    let mut last_chunk_ended_with_newline = true;
 
     loop {
         let n = file.read(&mut buf).await?;
@@ -544,28 +615,29 @@ async fn handle_file_route(
             lines_sent += newlines_in_chunk;
         }
 
-        // Meta frames before each D frame
-        writer.write_all(&frame_f_bytes(&decoded_path)).await?;
-        writer.write_all(&frame_o_bytes(offset)).await?;
-        writer.write_all(&frame_l_bytes(line_no)).await?;
+        // Write data packet with meta frames
+        write_data_packet(&mut writer, &decoded_path, offset, line_no, chunk).await?;
 
-        let header = frame_hdr_bytes(b'D', chunk.len() as u32);
-        writer.write_all(&header).await?;
-        writer.write_all(chunk).await?;
-
+        // Update offset: only count CSV payload bytes
         offset += chunk.len() as u64;
+        
+        // Update line_no: only count completed lines
         let newline_count = bytecount::count(chunk, b'\n') as u64;
-        let extra_line = if !chunk.is_empty() && chunk[chunk.len()-1] != b'\n' { 1 } else { 0 };
-        line_no += newline_count + extra_line;
+        line_no += newline_count;
+        
+        // Track if chunk ends with newline
+        last_chunk_ended_with_newline = chunk.last() == Some(&b'\n');
 
         if stop_streaming { break; }
     }
 
+    // At EOF: if last chunk didn't end with newline and we sent data, count the final partial line
+    if !last_chunk_ended_with_newline && offset > 0 {
+        line_no += 1;
+    }
+
     // EOF packet with meta frames
-    writer.write_all(&frame_f_bytes(&decoded_path)).await?;
-    writer.write_all(&frame_o_bytes(offset)).await?;
-    writer.write_all(&frame_l_bytes(line_no)).await?;
-    writer.write_all(&frame_eof_bytes()).await?;
+    write_eof_packet(&mut writer, &decoded_path, offset, line_no).await?;
 
     writer.flush().await?;
     Ok(())
@@ -609,6 +681,61 @@ fn frame_e_bytes(msg: &str) -> BytesMut {
 }
 
 fn frame_eof_bytes() -> [u8; 5] { frame_hdr_bytes(b'D', 0) }
+
+// ---------------- High-Level Framing Helpers ----------------
+
+/// Write F/O/L meta frames to the writer
+async fn write_meta<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    filename: &str,
+    offset: u64,
+    line_no: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    writer.write_all(&frame_f_bytes(filename)).await?;
+    writer.write_all(&frame_o_bytes(offset)).await?;
+    writer.write_all(&frame_l_bytes(line_no)).await?;
+    Ok(())
+}
+
+/// Write a complete data packet: F/O/L + D frame with CSV bytes
+async fn write_data_packet<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    filename: &str,
+    offset: u64,
+    line_no: u64,
+    csv_bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_meta(writer, filename, offset, line_no).await?;
+    let header = frame_hdr_bytes(b'D', csv_bytes.len() as u32);
+    writer.write_all(&header).await?;
+    writer.write_all(csv_bytes).await?;
+    Ok(())
+}
+
+/// Write an error packet: F/O/L + E frame
+async fn write_error_packet<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    filename: &str,
+    offset: u64,
+    line_no: u64,
+    err_msg: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_meta(writer, filename, offset, line_no).await?;
+    writer.write_all(&frame_e_bytes(err_msg)).await?;
+    Ok(())
+}
+
+/// Write an EOF packet: F/O/L + zero-length D frame
+async fn write_eof_packet<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    filename: &str,
+    offset: u64,
+    line_no: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_meta(writer, filename, offset, line_no).await?;
+    writer.write_all(&frame_eof_bytes()).await?;
+    Ok(())
+}
 
 // ---------------- Error Response ----------------
 
