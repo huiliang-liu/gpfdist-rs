@@ -102,10 +102,12 @@ async fn test_server_framing_single_fol_async() {
         f_count, o_count, l_count, d_count, eof_count
     );
 
-    // Verify: F/O/L frames should appear exactly once
-    assert_eq!(f_count, 1, "Should have exactly one F frame");
-    assert_eq!(o_count, 1, "Should have exactly one O frame");
-    assert_eq!(l_count, 1, "Should have exactly one L frame");
+    // Verify: With per-packet F/O/L semantics, we should have equal counts for F, O, L
+    // Each D frame (data + EOF) should be preceded by F/O/L
+    let total_d_frames = d_count + eof_count; // data D frames + EOF D frame
+    assert_eq!(f_count, total_d_frames as i32, "Should have F frame before each D/EOF");
+    assert_eq!(o_count, total_d_frames as i32, "Should have O frame before each D/EOF");
+    assert_eq!(l_count, total_d_frames as i32, "Should have L frame before each D/EOF");
 
     // Verify: At least one D frame with data
     assert!(d_count > 0, "Should have at least one D frame with data");
@@ -113,7 +115,7 @@ async fn test_server_framing_single_fol_async() {
     // Verify: Exactly one EOF frame
     assert_eq!(eof_count, 1, "Should have exactly one EOF frame");
 
-    // Verify frame order: F, O, L should come before any D frames
+    // Verify frame order: F, O, L should come before the first D frame
     i = 0;
     let mut seen_d = false;
     let mut f_before_d = false;

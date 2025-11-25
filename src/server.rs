@@ -3,18 +3,19 @@ use crate::util::{parse_query_map, percent_decode};
 use bytes::BytesMut;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Notify};
 
 use memchr::memmem;
 
-// ---------------- Session Management ----------------
+// ---------------- Session Management (Sequential Slice Model) ----------------
 
+/// Unique identifier for a gpfdist session (X-GP-XID, X-GP-CID, X-GP-SN)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
     xid: String,
@@ -22,29 +23,113 @@ struct SessionKey {
     sn: String,
 }
 
+/// Phase of the session lifecycle
 #[derive(Debug, Clone)]
-enum SessionStatus {
-    InProgress,
+#[allow(dead_code)]
+enum SessionPhase {
+    /// Session is actively reading data
+    Reading,
+    /// Session has successfully completed (all data consumed)
     Completed,
+    /// Session encountered an error (error message stored for replay)
+    Error(String),
 }
 
+/// A slice of data to be sent to a segment
 #[derive(Debug, Clone)]
-struct SessionState {
-    status: SessionStatus,
-    reader_claimed: bool, // true if a request is performing the primary read
-    started_at: Instant,
+struct DataSlice {
+    /// The CSV data bytes
+    data: Vec<u8>,
+    /// Starting byte offset for this slice
+    offset: u64,
+    /// Starting line number for this slice
+    line_number: u64,
+}
+
+/// Error frames to replay on error
+#[derive(Debug, Clone)]
+struct CachedErrorFrames {
+    error_message: String,
+    offset: u64,
+    line_number: u64,
+}
+
+/// A waiting segment connection
+struct SegmentSink {
+    /// Sender to deliver slices to this segment
+    tx: mpsc::Sender<SliceResult>,
+    /// Target bytes threshold for this segment's slice (0 = no limit)
+    target_bytes: usize,
+    /// Target lines threshold for this segment's slice (0 = no limit)
+    target_lines: usize,
+    /// Bytes already assigned to this segment's current slice
+    bytes_assigned: usize,
+    /// Lines already assigned to this segment's current slice
+    lines_assigned: usize,
+    /// Whether this segment has received all its data
+    finished: bool,
+}
+
+/// Result sent to a segment sink
+#[derive(Debug, Clone)]
+enum SliceResult {
+    /// Data slice to send
+    Data(DataSlice),
+    /// End of data for this segment
+    Eof { offset: u64, line_number: u64 },
+    /// Error occurred
+    Error(CachedErrorFrames),
+}
+
+/// Shared state for a session
+struct SessionShared {
+    /// Current phase of the session
+    phase: SessionPhase,
+    /// Next byte offset (updated as data is read)
+    next_offset: u64,
+    /// Next line number (updated as data is read)
+    next_line: u64,
+    /// Whether the last batch ended with a newline
+    #[allow(dead_code)]
+    last_batch_ended_with_newline: bool,
+    /// Queue of waiting segment sinks
+    pending_queue: VecDeque<SegmentSink>,
+    /// Index of the currently active sink receiving data
+    active_sink_index: Option<usize>,
+    /// Cached error frames for replay
+    cached_error_frames: Option<CachedErrorFrames>,
+    /// Logical filename for F frames (may be used for future enhancements)
+    #[allow(dead_code)]
+    logical_name: String,
+    /// Timestamp when session completed (for TTL eviction)
     completed_at: Option<Instant>,
+    /// Notify when new sinks are added
+    sink_notify: Arc<Notify>,
+    /// Whether the reader task has been started
+    reader_started: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SessionDecision {
-    StartRead,
-    ShortCircuitInProgress,
-    ShortCircuitCompleted,
+impl SessionShared {
+    fn new(logical_name: String) -> Self {
+        Self {
+            phase: SessionPhase::Reading,
+            next_offset: 0,
+            next_line: 1,
+            last_batch_ended_with_newline: true,
+            pending_queue: VecDeque::new(),
+            active_sink_index: None,
+            cached_error_frames: None,
+            logical_name,
+            completed_at: None,
+            sink_notify: Arc::new(Notify::new()),
+            reader_started: false,
+        }
+    }
 }
 
+/// Manager for all sessions
 struct SessionManager {
-    sessions: Mutex<HashMap<SessionKey, SessionState>>, 
+    sessions: Mutex<HashMap<SessionKey, Arc<Mutex<SessionShared>>>>,
 }
 
 impl SessionManager {
@@ -54,56 +139,40 @@ impl SessionManager {
         }
     }
 
-    async fn decide(&self, key: SessionKey) -> SessionDecision {
+    /// Get or create a session, returns (session, is_new)
+    async fn get_or_create(
+        &self,
+        key: SessionKey,
+        logical_name: String,
+    ) -> (Arc<Mutex<SessionShared>>, bool) {
         let mut sessions = self.sessions.lock().await;
-        match sessions.get_mut(&key) {
-            Some(state) => match state.status {
-                SessionStatus::InProgress => {
-                    if state.reader_claimed {
-                        SessionDecision::ShortCircuitInProgress
-                    } else {
-                        state.reader_claimed = true;
-                        SessionDecision::StartRead
-                    }
-                }
-                SessionStatus::Completed => SessionDecision::ShortCircuitCompleted,
-            },
-            None => {
-                sessions.insert(
-                    key,
-                    SessionState {
-                        status: SessionStatus::InProgress,
-                        reader_claimed: true,
-                        started_at: Instant::now(),
-                        completed_at: None,
-                    },
-                );
-                SessionDecision::StartRead
-            }
+        if let Some(session) = sessions.get(&key) {
+            (Arc::clone(session), false)
+        } else {
+            let session = Arc::new(Mutex::new(SessionShared::new(logical_name)));
+            sessions.insert(key, Arc::clone(&session));
+            (session, true)
         }
     }
 
-    async fn mark_completed(&self, key: &SessionKey) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(state) = sessions.get_mut(key) {
-            state.status = SessionStatus::Completed;
-            state.completed_at = Some(Instant::now());
-        }
-    }
-
+    /// Evict old completed sessions
     async fn evict_old_sessions(&self, ttl: Duration) {
         let mut sessions = self.sessions.lock().await;
         let now = Instant::now();
-        sessions.retain(|_, st| match st.status {
-            SessionStatus::Completed => {
-                if let Some(done) = st.completed_at {
-                    now.duration_since(done) < ttl
-                } else {
-                    true
+        
+        let mut keys_to_remove = Vec::new();
+        for (key, session) in sessions.iter() {
+            let guard = session.lock().await;
+            if let Some(completed_at) = guard.completed_at {
+                if now.duration_since(completed_at) >= ttl {
+                    keys_to_remove.push(key.clone());
                 }
             }
-            SessionStatus::InProgress => true,
-        });
+        }
+        
+        for key in keys_to_remove {
+            sessions.remove(&key);
+        }
     }
 }
 
@@ -117,7 +186,27 @@ fn extract_session_key(headers: &HashMap<String, String>) -> Option<SessionKey> 
     })
 }
 
-const INCLUDE_META_ON_REPEAT: bool = true;
+/// Get slice threshold configuration from environment
+fn get_slice_thresholds() -> (usize, usize) {
+    // Prefer line-based threshold if GPFDIST_SEGMENT_TARGET_LINES is set
+    let target_lines = std::env::var("GPFDIST_SEGMENT_TARGET_LINES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    
+    // Fallback to bytes threshold (default 1 MB)
+    let target_bytes = std::env::var("GPFDIST_SEGMENT_TARGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024 * 1024);
+    
+    // If lines threshold is set, use it; otherwise use bytes
+    if target_lines > 0 {
+        (0, target_lines)
+    } else {
+        (target_bytes, 0)
+    }
+}
 
 // ---------------- Utility ----------------
 
@@ -132,26 +221,6 @@ fn make_unique_table_name(source: &str, segid: Option<usize>) -> String {
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect();
     format!("{}_seg{}_{}", sanitized, sid, nanos)
-}
-
-// Short-circuit response for repeat sessions (in-progress or completed)
-async fn send_immediate_eof_response(
-    socket: &mut TcpStream,
-    gp_proto: u8,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: {}\r\nConnection: close\r\n\r\n",
-        gp_proto
-    );
-    socket.write_all(response.as_bytes()).await?;
-    if gp_proto == 1 {
-        // Always include meta frames then EOF zero-length D frame (per requirement all packets F/O/L/D)
-        socket.write_all(&frame_f_bytes("repeat_session")).await?;
-        socket.write_all(&frame_o_bytes(0)).await?;
-        socket.write_all(&frame_l_bytes(1)).await?;
-        socket.write_all(&frame_eof_bytes()).await?;
-    }
-    Ok(())
 }
 
 // ---------------- Server ----------------
@@ -177,7 +246,7 @@ impl Server {
             let eng = Arc::clone(&self.df_engine);
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(socket, eng).await {
-                    eprintln!("connection error: {{e}}{}");
+                    eprintln!("connection error: {}", e);
                 }
             });
         }
@@ -229,7 +298,7 @@ async fn handle_connection(
             headers.insert(line[..p].trim().to_lowercase(), line[p + 1..].trim().to_string());
         }
     }
-    eprintln!("DEBUG headers: {{:?}}{:?}", headers);
+    eprintln!("DEBUG headers: {:?}", headers);
 
     let gp_proto = headers.get("x-gp-proto").and_then(|v| v.parse::<u8>().ok());
 
@@ -336,42 +405,461 @@ async fn handle_df_route(
 
     let session_key = extract_session_key(headers);
 
-    let use_session_caching = match table_type {
+    // Determine if we should use session-based slice distribution
+    // Session caching is used for Delta/Iceberg when using path (not explicit file list)
+    let use_session_slicing = match table_type {
         #[cfg(feature = "delta")]
-        TableType::Delta => file_list.is_none(),
+        TableType::Delta => file_list.is_none() && session_key.is_some(),
         #[cfg(feature = "iceberg")]
-        TableType::Iceberg => file_list.is_none(),
-        TableType::Parquet => false,
+        TableType::Iceberg => file_list.is_none() && session_key.is_some(),
+        TableType::Parquet => false, // Parquet uses file-based segmentation, not session slicing
     };
 
-    if let Some(key) = &session_key {
-        if use_session_caching {
-            SESSION_MANAGER
-                .evict_old_sessions(Duration::from_secs(300))
-                .await;
+    if use_session_slicing {
+        // Use session-based slice distribution (Sequential Slice Model)
+        let key = session_key.as_ref().unwrap().clone();
+        handle_df_route_with_session(
+            raw_socket,
+            df_engine,
+            &key,
+            source.to_string(),
+            table_type,
+            uri.unwrap_or_default(),
+            file_list,
+            projection,
+            filter,
+            limit,
+            segment_id,
+            segment_count,
+            gp_proto,
+        )
+        .await
+    } else {
+        // Use traditional per-request execution (no session slicing)
+        handle_df_route_direct(
+            raw_socket,
+            df_engine,
+            source,
+            table_type,
+            uri.unwrap_or_default(),
+            file_list,
+            projection,
+            filter,
+            limit,
+            segment_id,
+            segment_count,
+            gp_proto,
+        )
+        .await
+    }
+}
 
-            match SESSION_MANAGER.decide(key.clone()).await {
-                SessionDecision::StartRead => {
-                    eprintln!("Session {:?} starting primary read", key);
-                }
-                SessionDecision::ShortCircuitInProgress => {
-                    eprintln!(
-                        "Session {:?} already has active reader (in-progress), short-circuit",
-                        key
-                    );
-                    send_immediate_eof_response(&mut raw_socket, gp_proto).await?;
+/// Handle /df route with session-based slice distribution (Sequential Slice Model)
+#[allow(clippy::too_many_arguments)]
+async fn handle_df_route_with_session(
+    mut socket: TcpStream,
+    df_engine: Arc<DFEngine>,
+    session_key: &SessionKey,
+    source: String,
+    table_type: TableType,
+    uri: String,
+    file_list: Option<Vec<String>>,
+    projection: Option<Vec<String>>,
+    filter: Option<String>,
+    limit: Option<usize>,
+    segment_id: Option<usize>,
+    _segment_count: Option<usize>,
+    gp_proto: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Evict old sessions periodically
+    SESSION_MANAGER
+        .evict_old_sessions(Duration::from_secs(300))
+        .await;
+
+    // Get or create the session
+    let (session, is_new) = SESSION_MANAGER
+        .get_or_create(session_key.clone(), source.clone())
+        .await;
+
+    // Get slice thresholds from environment
+    let (target_bytes, target_lines) = get_slice_thresholds();
+
+    // Create a channel for receiving slices
+    let (tx, mut rx) = mpsc::channel::<SliceResult>(16);
+
+    // Register this segment as a waiting sink
+    {
+        let mut guard = session.lock().await;
+        
+        // Check if session is already in a terminal state
+        match &guard.phase {
+            SessionPhase::Completed => {
+                // Session already completed - send immediate EOF
+                drop(guard);
+                send_eof_response(&mut socket, &source, 0, 1, gp_proto).await?;
+                return Ok(());
+            }
+            SessionPhase::Error(_) => {
+                // Session had an error - replay error frames
+                if let Some(ref cached) = guard.cached_error_frames {
+                    let cached = cached.clone();
+                    drop(guard);
+                    send_error_response(&mut socket, &source, &cached, gp_proto).await?;
                     return Ok(());
                 }
-                SessionDecision::ShortCircuitCompleted => {
-                    eprintln!("Session {:?} completed previously, short-circuit", key);
-                    send_immediate_eof_response(&mut raw_socket, gp_proto).await?;
-                    return Ok(());
+            }
+            SessionPhase::Reading => {
+                // Session is still reading - add ourselves to the queue
+            }
+        }
+
+        let sink = SegmentSink {
+            tx,
+            target_bytes,
+            target_lines,
+            bytes_assigned: 0,
+            lines_assigned: 0,
+            finished: false,
+        };
+        guard.pending_queue.push_back(sink);
+        
+        // Notify the reader task that a new sink is available
+        guard.sink_notify.notify_one();
+
+        // If this is a new session, start the reader task
+        if is_new && !guard.reader_started {
+            guard.reader_started = true;
+            let session_clone = Arc::clone(&session);
+            let df_engine_clone = Arc::clone(&df_engine);
+            
+            // Build the request for the reader task
+            let table_name = Some(make_unique_table_name(&source, segment_id));
+            let request = DFRequest {
+                table_type,
+                uri,
+                file_list,
+                projection,
+                filter,
+                limit,
+                // Reader task performs a full table scan (no segment-level query filtering).
+                // Slice distribution to segments is handled at the session layer, not at query level.
+                segment_id: None,
+                segment_count: None,
+                gp_proto,
+                table_name,
+            };
+
+            // Spawn the background reader task
+            tokio::spawn(async move {
+                run_session_reader(session_clone, df_engine_clone, request).await;
+            });
+        }
+    }
+
+    // Send HTTP response header
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: {}\r\nConnection: close\r\n\r\n",
+        gp_proto
+    );
+    socket.write_all(response.as_bytes()).await?;
+
+    let mut writer = BufWriter::with_capacity(64 * 1024, socket);
+
+    // Receive slices from the reader task and send to client
+    while let Some(slice_result) = rx.recv().await {
+        match slice_result {
+            SliceResult::Data(slice) => {
+                if gp_proto == 1 {
+                    // Write F/O/L/D frames
+                    writer.write_all(&frame_f_bytes(&source)).await?;
+                    writer.write_all(&frame_o_bytes(slice.offset)).await?;
+                    writer.write_all(&frame_l_bytes(slice.line_number)).await?;
+                    let header = frame_hdr_bytes(b'D', slice.data.len() as u32);
+                    writer.write_all(&header).await?;
+                    writer.write_all(&slice.data).await?;
+                } else {
+                    writer.write_all(&slice.data).await?;
+                }
+            }
+            SliceResult::Eof { offset, line_number } => {
+                if gp_proto == 1 {
+                    // Write F/O/L + EOF (D with length 0)
+                    eprintln!("Sending EOF frame: F/O/L + EOF at offset {}, line {}", offset, line_number);
+                    writer.write_all(&frame_f_bytes(&source)).await?;
+                    writer.write_all(&frame_o_bytes(offset)).await?;
+                    writer.write_all(&frame_l_bytes(line_number)).await?;
+                    writer.write_all(&frame_eof_bytes()).await?;
+                }
+                break;
+            }
+            SliceResult::Error(cached) => {
+                if gp_proto == 1 {
+                    // Write F/O/L + E + F/O/L + EOF
+                    writer.write_all(&frame_f_bytes(&source)).await?;
+                    writer.write_all(&frame_o_bytes(cached.offset)).await?;
+                    writer.write_all(&frame_l_bytes(cached.line_number)).await?;
+                    let err_msg = format!("ERROR: {}", cached.error_message);
+                    writer.write_all(&frame_e_bytes(&err_msg)).await?;
+                    writer.write_all(&frame_f_bytes(&source)).await?;
+                    writer.write_all(&frame_o_bytes(cached.offset)).await?;
+                    writer.write_all(&frame_l_bytes(cached.line_number)).await?;
+                    writer.write_all(&frame_eof_bytes()).await?;
+                }
+                break;
+            }
+        }
+    }
+
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Background reader task that pulls data from DataFusion and distributes to waiting segments
+async fn run_session_reader(
+    session: Arc<Mutex<SessionShared>>,
+    df_engine: Arc<DFEngine>,
+    request: DFRequest,
+) {
+    // Execute the query
+    let stream_result = df_engine.execute_csv_batches(request).await;
+
+    match stream_result {
+        Ok(mut stream) => {
+            // Process each batch from the stream
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(csv_bytes) => {
+                        if csv_bytes.is_empty() {
+                            continue;
+                        }
+
+                        // Calculate line count for this batch
+                        let newline_count = bytecount::count(&csv_bytes, b'\n') as u64;
+                        let ends_with_newline = csv_bytes.last() == Some(&b'\n');
+                        let bytes_len = csv_bytes.len() as u64;
+
+                        // Get current offset and line, then create the slice
+                        let mut guard = session.lock().await;
+                        let slice = DataSlice {
+                            data: csv_bytes.clone(),
+                            offset: guard.next_offset,
+                            line_number: guard.next_line,
+                        };
+
+                        // Update the session state
+                        let extra_line = if !ends_with_newline { 1 } else { 0 };
+                        guard.next_offset += bytes_len;
+                        guard.next_line += newline_count + extra_line;
+                        guard.last_batch_ended_with_newline = ends_with_newline;
+
+                        // Distribute the slice to the active sink or wait for one
+                        if !distribute_slice_to_sink(&mut guard, SliceResult::Data(slice)).await {
+                            // Distribution failed - can happen if all current sinks are finished
+                            // or disconnected. Wait for a new sink to register before retrying.
+                            let notify = Arc::clone(&guard.sink_notify);
+                            let saved_offset = guard.next_offset - bytes_len;
+                            let saved_line = guard.next_line - newline_count - extra_line;
+                            drop(guard);
+                            notify.notified().await;
+                            
+                            // Retry distribution with a new slice after a sink becomes available
+                            let mut guard = session.lock().await;
+                            let slice = DataSlice {
+                                data: csv_bytes,
+                                offset: saved_offset,
+                                line_number: saved_line,
+                            };
+                            let _ = distribute_slice_to_sink(&mut guard, SliceResult::Data(slice)).await;
+                        }
+                    }
+                    Err(e) => {
+                        // Error occurred - cache error and notify all waiting sinks
+                        let mut guard = session.lock().await;
+                        let cached = CachedErrorFrames {
+                            error_message: e.clone(),
+                            offset: guard.next_offset,
+                            line_number: guard.next_line,
+                        };
+                        guard.cached_error_frames = Some(cached.clone());
+                        guard.phase = SessionPhase::Error(e);
+                        
+                        // Send error to all waiting sinks
+                        for sink in guard.pending_queue.iter_mut() {
+                            if !sink.finished {
+                                let _ = sink.tx.send(SliceResult::Error(cached.clone())).await;
+                                sink.finished = true;
+                            }
+                        }
+                        guard.completed_at = Some(Instant::now());
+                        return;
+                    }
+                }
+            }
+
+            // All data consumed - send EOF to all remaining sinks
+            let mut guard = session.lock().await;
+            guard.phase = SessionPhase::Completed;
+            let final_offset = guard.next_offset;
+            let final_line = guard.next_line;
+            
+            // Send EOF to all waiting sinks
+            for sink in guard.pending_queue.iter_mut() {
+                if !sink.finished {
+                    let _ = sink.tx.send(SliceResult::Eof {
+                        offset: final_offset,
+                        line_number: final_line,
+                    }).await;
+                    sink.finished = true;
+                }
+            }
+            guard.completed_at = Some(Instant::now());
+        }
+        Err(e) => {
+            // Initial query execution failed
+            let mut guard = session.lock().await;
+            let cached = CachedErrorFrames {
+                error_message: e.clone(),
+                offset: 0,
+                line_number: 1,
+            };
+            guard.cached_error_frames = Some(cached.clone());
+            guard.phase = SessionPhase::Error(e);
+            
+            // Send error to all waiting sinks
+            for sink in guard.pending_queue.iter_mut() {
+                if !sink.finished {
+                    let _ = sink.tx.send(SliceResult::Error(cached.clone())).await;
+                    sink.finished = true;
+                }
+            }
+            guard.completed_at = Some(Instant::now());
+        }
+    }
+}
+
+/// Distribute a slice to the currently active sink or find a new one
+async fn distribute_slice_to_sink(
+    guard: &mut tokio::sync::MutexGuard<'_, SessionShared>,
+    slice: SliceResult,
+) -> bool {
+    // Find or activate a sink
+    if guard.active_sink_index.is_none() {
+        // Find the first non-finished sink
+        for (i, sink) in guard.pending_queue.iter().enumerate() {
+            if !sink.finished {
+                guard.active_sink_index = Some(i);
+                break;
+            }
+        }
+    }
+
+    if let Some(idx) = guard.active_sink_index {
+        if idx < guard.pending_queue.len() {
+            // Extract needed information from the sink up front
+            let sink_info = {
+                let sink = &guard.pending_queue[idx];
+                (sink.finished, sink.target_bytes, sink.target_lines, sink.tx.clone())
+            };
+            let (sink_finished, _target_bytes, _target_lines, tx) = sink_info;
+            
+            if !sink_finished {
+                // Calculate slice metrics
+                let slice_bytes = match &slice {
+                    SliceResult::Data(d) => d.data.len(),
+                    _ => 0,
+                };
+                let slice_lines = match &slice {
+                    SliceResult::Data(d) => bytecount::count(&d.data, b'\n'),
+                    _ => 0,
+                };
+
+                // Send the slice using the cloned sender
+                if tx.send(slice).await.is_ok() {
+                    // Update sink state after successful send
+                    let sink = &mut guard.pending_queue[idx];
+                    sink.bytes_assigned += slice_bytes;
+                    sink.lines_assigned += slice_lines;
+                    return true;
+                } else {
+                    // Sink disconnected - mark as finished
+                    guard.pending_queue[idx].finished = true;
+                    guard.active_sink_index = None;
                 }
             }
         }
     }
 
-    let table_name = if uri.is_some() && file_list.is_none() {
+    false
+}
+
+/// Send an immediate EOF response (for completed sessions)
+async fn send_eof_response(
+    socket: &mut TcpStream,
+    source: &str,
+    offset: u64,
+    line_number: u64,
+    gp_proto: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: {}\r\nConnection: close\r\n\r\n",
+        gp_proto
+    );
+    socket.write_all(response.as_bytes()).await?;
+    
+    if gp_proto == 1 {
+        socket.write_all(&frame_f_bytes(source)).await?;
+        socket.write_all(&frame_o_bytes(offset)).await?;
+        socket.write_all(&frame_l_bytes(line_number)).await?;
+        socket.write_all(&frame_eof_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// Send an error response (for sessions that encountered an error)
+async fn send_error_response(
+    socket: &mut TcpStream,
+    source: &str,
+    cached: &CachedErrorFrames,
+    gp_proto: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: {}\r\nConnection: close\r\n\r\n",
+        gp_proto
+    );
+    socket.write_all(response.as_bytes()).await?;
+    
+    if gp_proto == 1 {
+        // F/O/L + E + F/O/L + EOF
+        socket.write_all(&frame_f_bytes(source)).await?;
+        socket.write_all(&frame_o_bytes(cached.offset)).await?;
+        socket.write_all(&frame_l_bytes(cached.line_number)).await?;
+        let err_msg = format!("ERROR: {}", cached.error_message);
+        socket.write_all(&frame_e_bytes(&err_msg)).await?;
+        socket.write_all(&frame_f_bytes(source)).await?;
+        socket.write_all(&frame_o_bytes(cached.offset)).await?;
+        socket.write_all(&frame_l_bytes(cached.line_number)).await?;
+        socket.write_all(&frame_eof_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// Handle /df route with direct execution (no session slicing)
+#[allow(clippy::too_many_arguments)]
+async fn handle_df_route_direct(
+    mut socket: TcpStream,
+    df_engine: Arc<DFEngine>,
+    source: &str,
+    table_type: TableType,
+    uri: String,
+    file_list: Option<Vec<String>>,
+    projection: Option<Vec<String>>,
+    filter: Option<String>,
+    limit: Option<usize>,
+    segment_id: Option<usize>,
+    segment_count: Option<usize>,
+    gp_proto: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_name = if file_list.is_none() {
         Some(make_unique_table_name(source, segment_id))
     } else {
         None
@@ -379,7 +867,7 @@ async fn handle_df_route(
 
     let request = DFRequest {
         table_type,
-        uri: uri.unwrap_or_default(),
+        uri,
         file_list,
         projection,
         filter,
@@ -396,18 +884,18 @@ async fn handle_df_route(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: {}\r\nConnection: close\r\n\r\n",
                 gp_proto
             );
-            raw_socket.write_all(response.as_bytes()).await?;
+            socket.write_all(response.as_bytes()).await?;
 
-            let mut writer = BufWriter::with_capacity(64 * 1024, raw_socket);
+            let mut writer = BufWriter::with_capacity(64 * 1024, socket);
 
             if gp_proto == 1 {
                 let mut offset: u64 = 0;
-                let mut line_no: u64 = 1; // first line number before writing any data
+                let mut line_no: u64 = 1;
 
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(csv_bytes) => {
-                            // Emit meta frames BEFORE each D frame (F/O/L), using current offset & line_no
+                            // Emit F/O/L/D frames
                             writer.write_all(&frame_f_bytes(source)).await?;
                             writer.write_all(&frame_o_bytes(offset)).await?;
                             writer.write_all(&frame_l_bytes(line_no)).await?;
@@ -423,23 +911,24 @@ async fn handle_df_route(
                             line_no += newline_count + extra_line;
                         }
                         Err(e) => {
-                            // Error packet: send F/O/L + E + EOF (zero-length D)
+                            // Error packet: F/O/L + E + F/O/L + EOF
                             writer.write_all(&frame_f_bytes(source)).await?;
                             writer.write_all(&frame_o_bytes(offset)).await?;
                             writer.write_all(&frame_l_bytes(line_no)).await?;
                             let err_msg = format!("ERROR: {}", e);
                             writer.write_all(&frame_e_bytes(&err_msg)).await?;
-                            writer.write_all(&frame_f_bytes(source)).await?; // meta before EOF as well
+                            writer.write_all(&frame_f_bytes(source)).await?;
                             writer.write_all(&frame_o_bytes(offset)).await?;
                             writer.write_all(&frame_l_bytes(line_no)).await?;
                             writer.write_all(&frame_eof_bytes()).await?;
                             writer.flush().await?;
-                            if let Some(key) = &session_key { if use_session_caching { SESSION_MANAGER.mark_completed(key).await; } }
                             return Ok(());
                         }
                     }
                 }
-                // Final EOF packet also includes meta frames
+                // Final EOF packet
+                println!("Sending final EOF frame: F/O/L + EOF at offset {}, line {}", offset, line_no);
+
                 writer.write_all(&frame_f_bytes(source)).await?;
                 writer.write_all(&frame_o_bytes(offset)).await?;
                 writer.write_all(&frame_l_bytes(line_no)).await?;
@@ -453,12 +942,9 @@ async fn handle_df_route(
                 }
                 writer.flush().await?;
             }
-
-            if let Some(key) = &session_key { if use_session_caching { SESSION_MANAGER.mark_completed(key).await; } }
         }
         Err(e) => {
-            send_error(&mut raw_socket, 500, &format!("Query execution failed: {}", e)).await?;
-            if let Some(key) = &session_key { if use_session_caching { SESSION_MANAGER.mark_completed(key).await; } }
+            send_error(&mut socket, 500, &format!("Query execution failed: {}", e)).await?;
         }
     }
 
