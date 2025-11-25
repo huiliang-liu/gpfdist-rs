@@ -177,7 +177,7 @@ impl Server {
             let eng = Arc::clone(&self.df_engine);
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(socket, eng).await {
-                    eprintln!("connection error: {{e}}{}");
+                    eprintln!("connection error: {}", e);
                 }
             });
         }
