@@ -541,7 +541,9 @@ async fn handle_df_route_with_session(
                 projection,
                 filter,
                 limit,
-                segment_id: None, // Reader reads all data, no segment-level filtering
+                // Reader task performs a full table scan (no segment-level query filtering).
+                // Slice distribution to segments is handled at the session layer, not at query level.
+                segment_id: None,
                 segment_count: None,
                 gp_proto,
                 table_name,
@@ -651,15 +653,15 @@ async fn run_session_reader(
 
                         // Distribute the slice to the active sink or wait for one
                         if !distribute_slice_to_sink(&mut guard, SliceResult::Data(slice)).await {
-                            // No sink available and couldn't distribute - this shouldn't happen
-                            // but if it does, we'll wait for a sink
+                            // Distribution failed - can happen if all current sinks are finished
+                            // or disconnected. Wait for a new sink to register before retrying.
                             let notify = Arc::clone(&guard.sink_notify);
                             let saved_offset = guard.next_offset - bytes_len;
                             let saved_line = guard.next_line - newline_count - extra_line;
                             drop(guard);
                             notify.notified().await;
                             
-                            // Try again after notification
+                            // Retry distribution with a new slice after a sink becomes available
                             let mut guard = session.lock().await;
                             let slice = DataSlice {
                                 data: csv_bytes,
@@ -752,13 +754,15 @@ async fn distribute_slice_to_sink(
 
     if let Some(idx) = guard.active_sink_index {
         if idx < guard.pending_queue.len() {
-            // First, check if the sink is finished and extract info we need
-            let sink_finished = guard.pending_queue[idx].finished;
-            let target_bytes = guard.pending_queue[idx].target_bytes;
-            let target_lines = guard.pending_queue[idx].target_lines;
+            // Extract needed information from the sink up front
+            let sink_info = {
+                let sink = &guard.pending_queue[idx];
+                (sink.finished, sink.target_bytes, sink.target_lines, sink.tx.clone())
+            };
+            let (sink_finished, target_bytes, target_lines, tx) = sink_info;
             
             if !sink_finished {
-                // Check if this sink has reached its threshold
+                // Calculate slice metrics
                 let slice_bytes = match &slice {
                     SliceResult::Data(d) => d.data.len(),
                     _ => 0,
@@ -768,40 +772,35 @@ async fn distribute_slice_to_sink(
                     _ => 0,
                 };
 
-                // Send the slice
-                let sink = &guard.pending_queue[idx];
-                let send_result = sink.tx.send(slice).await;
-                
-                if send_result.is_ok() {
+                // Send the slice using the cloned sender
+                if tx.send(slice).await.is_ok() {
+                    // Update sink state after successful send
                     let sink = &mut guard.pending_queue[idx];
                     sink.bytes_assigned += slice_bytes;
                     sink.lines_assigned += slice_lines;
+                    let bytes_assigned = sink.bytes_assigned;
+                    let lines_assigned = sink.lines_assigned;
 
                     // Check if threshold reached
                     let threshold_reached = 
-                        (target_bytes > 0 && sink.bytes_assigned >= target_bytes) ||
-                        (target_lines > 0 && sink.lines_assigned >= target_lines);
+                        (target_bytes > 0 && bytes_assigned >= target_bytes) ||
+                        (target_lines > 0 && lines_assigned >= target_lines);
 
                     if threshold_reached {
                         // This sink is done with its slice - send EOF and move to next
-                        // First capture the values we need
-                        let next_offset = guard.next_offset;
-                        let next_line = guard.next_line;
                         let eof = SliceResult::Eof {
-                            offset: next_offset,
-                            line_number: next_line,
+                            offset: guard.next_offset,
+                            line_number: guard.next_line,
                         };
-                        let sink = &guard.pending_queue[idx];
-                        let _ = sink.tx.send(eof).await;
-                        let sink = &mut guard.pending_queue[idx];
-                        sink.finished = true;
+                        // Use the cloned tx to send EOF
+                        let _ = tx.send(eof).await;
+                        guard.pending_queue[idx].finished = true;
                         guard.active_sink_index = None;
                     }
                     return true;
                 } else {
-                    // Sink disconnected
-                    let sink = &mut guard.pending_queue[idx];
-                    sink.finished = true;
+                    // Sink disconnected - mark as finished
+                    guard.pending_queue[idx].finished = true;
                     guard.active_sink_index = None;
                 }
             }
