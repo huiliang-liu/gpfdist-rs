@@ -159,7 +159,7 @@ impl SessionManager {
     async fn evict_old_sessions(&self, ttl: Duration) {
         let mut sessions = self.sessions.lock().await;
         let now = Instant::now();
-        
+
         let mut keys_to_remove = Vec::new();
         for (key, session) in sessions.iter() {
             let guard = session.lock().await;
@@ -169,7 +169,7 @@ impl SessionManager {
                 }
             }
         }
-        
+
         for key in keys_to_remove {
             sessions.remove(&key);
         }
@@ -193,13 +193,13 @@ fn get_slice_thresholds() -> (usize, usize) {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
-    
+
     // Fallback to bytes threshold (default 1 MB)
     let target_bytes = std::env::var("GPFDIST_SEGMENT_TARGET_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1024 * 1024);
-    
+
     // If lines threshold is set, use it; otherwise use bytes
     if target_lines > 0 {
         (0, target_lines)
@@ -295,7 +295,10 @@ async fn handle_connection(
             break;
         }
         if let Some(p) = line.find(':') {
-            headers.insert(line[..p].trim().to_lowercase(), line[p + 1..].trim().to_string());
+            headers.insert(
+                line[..p].trim().to_lowercase(),
+                line[p + 1..].trim().to_string(),
+            );
         }
     }
     eprintln!("DEBUG headers: {:?}", headers);
@@ -490,7 +493,7 @@ async fn handle_df_route_with_session(
     // Register this segment as a waiting sink
     {
         let mut guard = session.lock().await;
-        
+
         // Check if session is already in a terminal state
         match &guard.phase {
             SessionPhase::Completed => {
@@ -522,7 +525,7 @@ async fn handle_df_route_with_session(
             finished: false,
         };
         guard.pending_queue.push_back(sink);
-        
+
         // Notify the reader task that a new sink is available
         guard.sink_notify.notify_one();
 
@@ -531,7 +534,7 @@ async fn handle_df_route_with_session(
             guard.reader_started = true;
             let session_clone = Arc::clone(&session);
             let df_engine_clone = Arc::clone(&df_engine);
-            
+
             // Build the request for the reader task
             let table_name = Some(make_unique_table_name(&source, segment_id));
             let request = DFRequest {
@@ -563,7 +566,7 @@ async fn handle_df_route_with_session(
     );
     socket.write_all(response.as_bytes()).await?;
 
-    let mut writer = BufWriter::with_capacity(64 * 1024, socket);
+    let mut writer = BufWriter::with_capacity(1 * 1024 * 1024, socket);
 
     // Receive slices from the reader task and send to client
     while let Some(slice_result) = rx.recv().await {
@@ -581,10 +584,16 @@ async fn handle_df_route_with_session(
                     writer.write_all(&slice.data).await?;
                 }
             }
-            SliceResult::Eof { offset, line_number } => {
+            SliceResult::Eof {
+                offset,
+                line_number,
+            } => {
                 if gp_proto == 1 {
                     // Write F/O/L + EOF (D with length 0)
-                    eprintln!("Sending EOF frame: F/O/L + EOF at offset {}, line {}", offset, line_number);
+                    eprintln!(
+                        "Sending EOF frame: F/O/L + EOF at offset {}, line {}",
+                        offset, line_number
+                    );
                     writer.write_all(&frame_f_bytes(&source)).await?;
                     writer.write_all(&frame_o_bytes(offset)).await?;
                     writer.write_all(&frame_l_bytes(line_number)).await?;
@@ -661,7 +670,7 @@ async fn run_session_reader(
                             let saved_line = guard.next_line - newline_count - extra_line;
                             drop(guard);
                             notify.notified().await;
-                            
+
                             // Retry distribution with a new slice after a sink becomes available
                             let mut guard = session.lock().await;
                             let slice = DataSlice {
@@ -669,7 +678,8 @@ async fn run_session_reader(
                                 offset: saved_offset,
                                 line_number: saved_line,
                             };
-                            let _ = distribute_slice_to_sink(&mut guard, SliceResult::Data(slice)).await;
+                            let _ = distribute_slice_to_sink(&mut guard, SliceResult::Data(slice))
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -682,7 +692,7 @@ async fn run_session_reader(
                         };
                         guard.cached_error_frames = Some(cached.clone());
                         guard.phase = SessionPhase::Error(e);
-                        
+
                         // Send error to all waiting sinks
                         for sink in guard.pending_queue.iter_mut() {
                             if !sink.finished {
@@ -701,14 +711,17 @@ async fn run_session_reader(
             guard.phase = SessionPhase::Completed;
             let final_offset = guard.next_offset;
             let final_line = guard.next_line;
-            
+
             // Send EOF to all waiting sinks
             for sink in guard.pending_queue.iter_mut() {
                 if !sink.finished {
-                    let _ = sink.tx.send(SliceResult::Eof {
-                        offset: final_offset,
-                        line_number: final_line,
-                    }).await;
+                    let _ = sink
+                        .tx
+                        .send(SliceResult::Eof {
+                            offset: final_offset,
+                            line_number: final_line,
+                        })
+                        .await;
                     sink.finished = true;
                 }
             }
@@ -724,7 +737,7 @@ async fn run_session_reader(
             };
             guard.cached_error_frames = Some(cached.clone());
             guard.phase = SessionPhase::Error(e);
-            
+
             // Send error to all waiting sinks
             for sink in guard.pending_queue.iter_mut() {
                 if !sink.finished {
@@ -758,10 +771,15 @@ async fn distribute_slice_to_sink(
             // Extract needed information from the sink up front
             let sink_info = {
                 let sink = &guard.pending_queue[idx];
-                (sink.finished, sink.target_bytes, sink.target_lines, sink.tx.clone())
+                (
+                    sink.finished,
+                    sink.target_bytes,
+                    sink.target_lines,
+                    sink.tx.clone(),
+                )
             };
             let (sink_finished, _target_bytes, _target_lines, tx) = sink_info;
-            
+
             if !sink_finished {
                 // Calculate slice metrics
                 let slice_bytes = match &slice {
@@ -805,7 +823,7 @@ async fn send_eof_response(
         gp_proto
     );
     socket.write_all(response.as_bytes()).await?;
-    
+
     if gp_proto == 1 {
         socket.write_all(&frame_f_bytes(source)).await?;
         socket.write_all(&frame_o_bytes(offset)).await?;
@@ -827,7 +845,7 @@ async fn send_error_response(
         gp_proto
     );
     socket.write_all(response.as_bytes()).await?;
-    
+
     if gp_proto == 1 {
         // F/O/L + E + F/O/L + EOF
         socket.write_all(&frame_f_bytes(source)).await?;
@@ -886,7 +904,7 @@ async fn handle_df_route_direct(
             );
             socket.write_all(response.as_bytes()).await?;
 
-            let mut writer = BufWriter::with_capacity(64 * 1024, socket);
+            let mut writer = BufWriter::with_capacity(1 * 1024 * 1024, socket);
 
             if gp_proto == 1 {
                 let mut offset: u64 = 0;
@@ -907,7 +925,12 @@ async fn handle_df_route_direct(
                             // Update offset & line_no for next packet
                             offset += csv_bytes.len() as u64;
                             let newline_count = bytecount::count(&csv_bytes, b'\n') as u64;
-                            let extra_line = if !csv_bytes.is_empty() && *csv_bytes.last().unwrap() != b'\n' { 1 } else { 0 };
+                            let extra_line =
+                                if !csv_bytes.is_empty() && *csv_bytes.last().unwrap() != b'\n' {
+                                    1
+                                } else {
+                                    0
+                                };
                             line_no += newline_count + extra_line;
                         }
                         Err(e) => {
@@ -927,7 +950,10 @@ async fn handle_df_route_direct(
                     }
                 }
                 // Final EOF packet
-                println!("Sending final EOF frame: F/O/L + EOF at offset {}, line {}", offset, line_no);
+                println!(
+                    "Sending final EOF frame: F/O/L + EOF at offset {}, line {}",
+                    offset, line_no
+                );
 
                 writer.write_all(&frame_f_bytes(source)).await?;
                 writer.write_all(&frame_o_bytes(offset)).await?;
@@ -982,7 +1008,11 @@ async fn handle_file_route(
     let mut file = match File::open(&resolved_path).await {
         Ok(f) => f,
         Err(e) => {
-            let err_msg = format!("Failed to read file: {}, error {}", resolved_path.display(), e);
+            let err_msg = format!(
+                "Failed to read file: {}, error {}",
+                resolved_path.display(),
+                e
+            );
             eprintln!("{}", err_msg);
             let response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await?;
@@ -1003,7 +1033,7 @@ async fn handle_file_route(
     let response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
     socket.write_all(response.as_bytes()).await?;
 
-    let mut writer = BufWriter::with_capacity(64 * 1024, socket);
+    let mut writer = BufWriter::with_capacity(1 * 1024 * 1024, socket);
 
     let mut offset: u64 = 0;
     let mut line_no: u64 = 1;
@@ -1013,18 +1043,29 @@ async fn handle_file_route(
 
     loop {
         let n = file.read(&mut buf).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let mut chunk = &buf[..n];
 
         if let Some(limit) = lines_limit {
             let newlines_in_chunk = bytecount::count(chunk, b'\n');
             if lines_sent + newlines_in_chunk >= limit {
                 let needed = limit - lines_sent;
-                let mut pos = 0; let mut found = 0;
+                let mut pos = 0;
+                let mut found = 0;
                 for (i, &b) in chunk.iter().enumerate() {
-                    if b == b'\n' { found += 1; if found == needed { pos = i + 1; break; } }
+                    if b == b'\n' {
+                        found += 1;
+                        if found == needed {
+                            pos = i + 1;
+                            break;
+                        }
+                    }
                 }
-                if pos > 0 { chunk = &chunk[..pos]; }
+                if pos > 0 {
+                    chunk = &chunk[..pos];
+                }
                 stop_streaming = true;
             }
             lines_sent += newlines_in_chunk;
@@ -1041,10 +1082,16 @@ async fn handle_file_route(
 
         offset += chunk.len() as u64;
         let newline_count = bytecount::count(chunk, b'\n') as u64;
-        let extra_line = if !chunk.is_empty() && chunk[chunk.len()-1] != b'\n' { 1 } else { 0 };
+        let extra_line = if !chunk.is_empty() && chunk[chunk.len() - 1] != b'\n' {
+            1
+        } else {
+            0
+        };
         line_no += newline_count + extra_line;
 
-        if stop_streaming { break; }
+        if stop_streaming {
+            break;
+        }
     }
 
     // EOF packet with meta frames
@@ -1094,7 +1141,9 @@ fn frame_e_bytes(msg: &str) -> BytesMut {
     buf
 }
 
-fn frame_eof_bytes() -> [u8; 5] { frame_hdr_bytes(b'D', 0) }
+fn frame_eof_bytes() -> [u8; 5] {
+    frame_hdr_bytes(b'D', 0)
+}
 
 // ---------------- Error Response ----------------
 

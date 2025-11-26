@@ -1,5 +1,5 @@
 /// Tests for the Sequential Slice session semantics
-/// 
+///
 /// These tests validate the new session management model where:
 /// - A logical session (X-GP-XID, X-GP-CID, X-GP-SN) performs a single sequential scan
 /// - Data is partitioned into consecutive non-overlapping slices
@@ -55,12 +55,7 @@ mod session_slice_tests {
         Ok(())
     }
 
-    async fn make_request_with_session(
-        url: &str,
-        xid: &str,
-        cid: &str,
-        sn: &str,
-    ) -> Vec<u8> {
+    async fn make_request_with_session(url: &str, xid: &str, cid: &str, sn: &str) -> Vec<u8> {
         let request = format!(
             "GET /df/delta?{} HTTP/1.1\r\n\
              Host: localhost:18086\r\n\
@@ -173,7 +168,10 @@ mod session_slice_tests {
         let frames = &response1[header_end..];
         let (f, o, l, d, eof) = count_frame_types(frames);
 
-        println!("First request: F={}, O={}, L={}, D={}, EOF={}", f, o, l, d, eof);
+        println!(
+            "First request: F={}, O={}, L={}, D={}, EOF={}",
+            f, o, l, d, eof
+        );
 
         // Should have at least F/O/L before the data (or EOF if immediate)
         assert!(f >= 1, "Should have at least one F frame");
@@ -235,7 +233,7 @@ mod session_slice_tests {
 
         // First request should have data
         assert!(d1 > 0 || eof1 > 0, "First request should have data or EOF");
-        
+
         // Second request should be just EOF (since session completed)
         assert_eq!(eof2, 1, "Second request should have EOF");
 
@@ -369,8 +367,7 @@ mod framing_tests {
         let mut i = 0;
         while i + 5 <= data.len() {
             let frame_type = data[i] as char;
-            let length =
-                u32::from_be_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
+            let length = u32::from_be_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
             frames.push((frame_type, length));
             i += 5 + length as usize;
         }
@@ -381,48 +378,48 @@ mod framing_tests {
     fn test_frame_sequence_parsing() {
         // Build a test frame sequence: F/O/L/D/F/O/L/EOF
         let mut data = Vec::new();
-        
+
         // F frame with "test" filename
         data.push(b'F');
         data.extend_from_slice(&4u32.to_be_bytes());
         data.extend_from_slice(b"test");
-        
+
         // O frame with offset 0
         data.push(b'O');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&0u64.to_be_bytes());
-        
+
         // L frame with line 1
         data.push(b'L');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&1u64.to_be_bytes());
-        
+
         // D frame with some data
         data.push(b'D');
         data.extend_from_slice(&5u32.to_be_bytes());
         data.extend_from_slice(b"hello");
-        
+
         // F frame for EOF
         data.push(b'F');
         data.extend_from_slice(&4u32.to_be_bytes());
         data.extend_from_slice(b"test");
-        
+
         // O frame for EOF
         data.push(b'O');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&5u64.to_be_bytes());
-        
+
         // L frame for EOF
         data.push(b'L');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&2u64.to_be_bytes());
-        
+
         // EOF (D with length 0)
         data.push(b'D');
         data.extend_from_slice(&0u32.to_be_bytes());
 
         let frames = parse_frames(&data);
-        
+
         // Verify frame sequence
         assert_eq!(frames.len(), 8);
         assert_eq!(frames[0], ('F', 4));
@@ -439,49 +436,49 @@ mod framing_tests {
     fn test_error_frame_sequence() {
         // Build a test error frame sequence: F/O/L/E/F/O/L/EOF
         let mut data = Vec::new();
-        
+
         // F frame
         data.push(b'F');
         data.extend_from_slice(&4u32.to_be_bytes());
         data.extend_from_slice(b"test");
-        
+
         // O frame
         data.push(b'O');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&0u64.to_be_bytes());
-        
+
         // L frame
         data.push(b'L');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&1u64.to_be_bytes());
-        
+
         // E frame with error message
         let error_msg = b"ERROR: test error";
         data.push(b'E');
         data.extend_from_slice(&(error_msg.len() as u32).to_be_bytes());
         data.extend_from_slice(error_msg);
-        
+
         // F frame for EOF
         data.push(b'F');
         data.extend_from_slice(&4u32.to_be_bytes());
         data.extend_from_slice(b"test");
-        
+
         // O frame for EOF
         data.push(b'O');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&0u64.to_be_bytes());
-        
+
         // L frame for EOF
         data.push(b'L');
         data.extend_from_slice(&8u32.to_be_bytes());
         data.extend_from_slice(&1u64.to_be_bytes());
-        
+
         // EOF
         data.push(b'D');
         data.extend_from_slice(&0u32.to_be_bytes());
 
         let frames = parse_frames(&data);
-        
+
         // Verify frame sequence
         assert_eq!(frames.len(), 8);
         assert_eq!(frames[0], ('F', 4));
