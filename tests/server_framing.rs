@@ -105,9 +105,18 @@ async fn test_server_framing_single_fol_async() {
     // Verify: With per-packet F/O/L semantics, we should have equal counts for F, O, L
     // Each D frame (data + EOF) should be preceded by F/O/L
     let total_d_frames = d_count + eof_count; // data D frames + EOF D frame
-    assert_eq!(f_count, total_d_frames as i32, "Should have F frame before each D/EOF");
-    assert_eq!(o_count, total_d_frames as i32, "Should have O frame before each D/EOF");
-    assert_eq!(l_count, total_d_frames as i32, "Should have L frame before each D/EOF");
+    assert_eq!(
+        f_count, total_d_frames as i32,
+        "Should have F frame before each D/EOF"
+    );
+    assert_eq!(
+        o_count, total_d_frames as i32,
+        "Should have O frame before each D/EOF"
+    );
+    assert_eq!(
+        l_count, total_d_frames as i32,
+        "Should have L frame before each D/EOF"
+    );
 
     // Verify: At least one D frame with data
     assert!(d_count > 0, "Should have at least one D frame with data");

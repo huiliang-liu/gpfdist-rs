@@ -159,27 +159,41 @@ impl DFEngine {
     }
 
     /// Convert a stream of RecordBatch to a stream of raw CSV bytes
+    ///
+    /// Uses parallel CSV encoding with `buffered(concurrency)` to run up to K conversions
+    /// concurrently while preserving original batch ordering for downstream offset/line
+    /// numbering correctness.
     fn convert_to_csv_stream(
         &self,
-        mut batches: Pin<Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>>,
+        batches: Pin<Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>>,
     ) -> impl Stream<Item = Result<Vec<u8>, String>> + Send {
-        async_stream::try_stream! {
-            while let Some(batch_result) = batches.next().await {
-                let batch = batch_result.map_err(|e| format!("Failed to get batch: {}", e))?;
+        // Concurrency heuristic: max(2, num_cpus / 2)
+        let concurrency = std::cmp::max(2, num_cpus::get() / 2);
 
-                // Convert batch to CSV in a blocking task
-                let csv_data = tokio::task::spawn_blocking(move || {
-                    batch_to_csv(&batch)
-                })
-                .await
-                .map_err(|e| format!("Failed to spawn blocking task: {}", e))?
-                .map_err(|e| format!("Failed to convert batch to CSV: {}", e))?;
-
-                if !csv_data.is_empty() {
-                    yield csv_data;
+        batches
+            // Transform each batch result into an async task that performs CSV encoding
+            .map(|batch_result| async move {
+                match batch_result {
+                    Ok(batch) => {
+                        // Convert batch to CSV in a blocking task
+                        tokio::task::spawn_blocking(move || batch_to_csv(&batch))
+                            .await
+                            .map_err(|e| format!("Failed to spawn blocking task: {}", e))?
+                            .map_err(|e| format!("Failed to convert batch to CSV: {}", e))
+                    }
+                    Err(e) => Err(format!("Failed to get batch: {}", e)),
                 }
-            }
-        }
+            })
+            // Run up to `concurrency` conversions in parallel, preserving order
+            .buffered(concurrency)
+            // Filter out empty CSV results
+            .filter_map(|res| async move {
+                match res {
+                    Ok(csv_data) if !csv_data.is_empty() => Some(Ok(csv_data)),
+                    Ok(_) => None, // Empty CSV, skip
+                    Err(e) => Some(Err(e)),
+                }
+            })
     }
 
     /// Execute the request and return a stream of bytes in gpfdist format
