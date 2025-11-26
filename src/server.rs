@@ -13,6 +13,9 @@ use tokio::sync::{mpsc, Mutex, Notify};
 
 use memchr::memmem;
 
+/// Network write buffer size (1 MiB) - larger buffer reduces write syscalls
+const NETWORK_WRITE_BUFFER_SIZE: usize = 1 * 1024 * 1024;
+
 // ---------------- Session Management (Sequential Slice Model) ----------------
 
 /// Unique identifier for a gpfdist session (X-GP-XID, X-GP-CID, X-GP-SN)
@@ -566,7 +569,7 @@ async fn handle_df_route_with_session(
     );
     socket.write_all(response.as_bytes()).await?;
 
-    let mut writer = BufWriter::with_capacity(1 * 1024 * 1024, socket);
+    let mut writer = BufWriter::with_capacity(NETWORK_WRITE_BUFFER_SIZE, socket);
 
     // Receive slices from the reader task and send to client
     while let Some(slice_result) = rx.recv().await {
@@ -904,7 +907,7 @@ async fn handle_df_route_direct(
             );
             socket.write_all(response.as_bytes()).await?;
 
-            let mut writer = BufWriter::with_capacity(1 * 1024 * 1024, socket);
+            let mut writer = BufWriter::with_capacity(NETWORK_WRITE_BUFFER_SIZE, socket);
 
             if gp_proto == 1 {
                 let mut offset: u64 = 0;
@@ -1033,7 +1036,7 @@ async fn handle_file_route(
     let response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-GP-PROTO: 1\r\nConnection: close\r\n\r\n";
     socket.write_all(response.as_bytes()).await?;
 
-    let mut writer = BufWriter::with_capacity(1 * 1024 * 1024, socket);
+    let mut writer = BufWriter::with_capacity(NETWORK_WRITE_BUFFER_SIZE, socket);
 
     let mut offset: u64 = 0;
     let mut line_no: u64 = 1;
